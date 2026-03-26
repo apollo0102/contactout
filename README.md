@@ -67,7 +67,7 @@ By default the browser window is visible. Set `HEADLESS=1` to run headless. **Pe
 | `STOP_ON_DUPLICATE_PAGE` | No | Default **on**: if page **N** returns the **same people** as page **N−1** (ContactOut often caps pagination and repeats the last page), the bot **stops without writing** that duplicate and tells you to change **`SEARCH_KEYWORD`**, **`CONTACTOUT_LOCATION`**, **`SEARCH_PROFILE`**, or **`CONTACTOUT_SEARCH_URL`**. Set `0` / `false` to disable |
 | `HEADLESS` | No | Set to `1` or `true` to run Chromium headless |
 | `PROXIES` | No | **JSON array**, bracket list, or one URL per line. If **`PROXIES_FILE`** is set too, both are **merged** (deduped) |
-| `PROXIES_FILE` | No | Large list file, e.g. **`./data/proxies.txt`** for [Proxifly](https://proxifly.dev)-style **`http://ip:port`** lines. Path is relative to the **project root** |
+| `PROXIES_FILE` | No | Large list file, e.g. **`./ref/proxies.txt`** for [Proxifly](https://proxifly.dev)-style **`http://ip:port`** lines. Path is relative to the **project root** |
 | `PROXY_URL` | No | One proxy server: `http://host:8080`, `http://user:pass@host:8080`, or `socks5://host:1080` |
 | `PROXY_LIST` | No | Comma- or newline-separated list of proxies (rotates). Also: `PROXY_LIST_FILE` = path to a `.txt` (one proxy per line) |
 | `PROXY_ROTATE_EVERY` | No | After this many **successful** page exports, switch to the next proxy (`0` = rotate only after HTTP **429**; needs **several** proxies in `PROXY_LIST`) |
@@ -99,7 +99,7 @@ MAX_PAGES=5
 # START_PAGE=4
 # Proxy rotation (example)
 # PROXIES=["http://user:pass@1.2.3.4:8000","socks5://user:pass@5.6.7.8:1080"]
-# PROXIES_FILE=./data/proxies.txt
+# PROXIES_FILE=./ref/proxies.txt
 # PROXY_URL=http://127.0.0.1:8888
 # PROXY_LIST=http://user-a:pass@gate1.example.com:7777,http://user-b:pass@gate2.example.com:7777
 # PROXY_ROTATE_EVERY=10
@@ -120,10 +120,10 @@ Traffic through an **HTTP/HTTPS proxy** does not use ICMP. The bot runs a small 
 
 ### Free lists (e.g. Proxifly)
 
-1. Paste Proxifly’s **`http://ip:port`** lines into **`data/proxies.txt`** (one per line — your file is already in that shape).
+1. Paste Proxifly’s **`http://ip:port`** lines into **`ref/proxies.txt`** (one per line — your file is already in that shape).
 2. In **`.env`** add:
    ```env
-   PROXIES_FILE=./data/proxies.txt
+   PROXIES_FILE=./ref/proxies.txt
    ```
 3. Optional: set **`PROXY_ROTATE_EVERY=5`** (or `10`) so each outbound IP is only used for a few pages before switching — free proxies often rate-limit or die quickly.
 4. You can keep **`PROXIES=...`** in `.env` for paid/auth proxies; they are **combined** with the file list (duplicates removed).

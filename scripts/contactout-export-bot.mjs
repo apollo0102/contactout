@@ -44,7 +44,7 @@
  *
  *   Proxy (optional; uses launch()+context instead of persistent profile):
  *   PROXIES — JSON / bracket list / one URL per line (merged with PROXIES_FILE if both set)
- *   PROXIES_FILE — e.g. ./data/proxies.txt (Proxifly: one http://ip:port per line). Relative to project root
+ *   PROXIES_FILE — e.g. ./ref/proxies.txt (Proxifly: one http://ip:port per line). Relative to project root
  *   PROXY_URL — single proxy
  *   PROXY_LIST — comma/newline-separated list. Or PROXY_LIST_FILE = path to .txt
  *   PROXY_ROTATE_EVERY — after N successful page exports, rotate to next proxy (0 = only on 429)
@@ -78,6 +78,7 @@ const SCRAPE_DOM_EVAL_PATH = path.join(
   __dirname,
   "contactout-scrape-dom-eval.js"
 );
+const DEFAULT_PROXIES_FILE = path.join(ROOT, "ref", "proxies.txt");
 
 /** Same DOM scrape as `contactout_extension/content.js` (keep in sync with that file). */
 let scrapeDomEvalSource = "";
@@ -242,13 +243,13 @@ function parseProxiesRawBlock(raw) {
 function parseProxiesEnvArray() {
   const blocks = [];
   const pathFile = process.env.PROXIES_FILE?.trim();
-  if (pathFile) {
-    const abs = path.isAbsolute(pathFile)
+  const abs = pathFile
+    ? path.isAbsolute(pathFile)
       ? pathFile
-      : path.resolve(ROOT, pathFile);
-    if (fs.existsSync(abs)) {
-      blocks.push(fs.readFileSync(abs, "utf8"));
-    }
+      : path.resolve(ROOT, pathFile)
+    : DEFAULT_PROXIES_FILE;
+  if (fs.existsSync(abs)) {
+    blocks.push(fs.readFileSync(abs, "utf8"));
   }
   const env = process.env.PROXIES?.trim();
   if (env) blocks.push(env);
