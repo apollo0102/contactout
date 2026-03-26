@@ -3,7 +3,7 @@
 This repo contains:
 
 1. **Chrome extension** (`contactout_extension/`) — optional manual use: scrapes ContactOut people-search results on the current tab and downloads a CSV (full name, LinkedIn URL, work email domain).
-2. **Playwright bot** (`npm run export`) — **does not use the extension.** It opens the dashboard search URL (e.g. [`/dashboard/search?location=United%20States`](https://contactout.com/dashboard/search?location=United%20States)), logs in only if needed, then for each page loads `…&page=1`, `…&page=2`, … (incrementing `page` by 1), runs the **same DOM scrape** as the extension (see `scripts/contactout-scrape-dom-eval.js`), and saves a CSV per page. It records completed `page=` values in **`data/search-history.json`** (per search URL) so **re-runs skip pages already exported**. After each run it writes **`contactout-merged-*.csv`** in the **`data/`** folder (same directory as `search-history.json`) — one deduplicated file (by LinkedIn URL) combining **all rows collected in that run** from the per-page CSVs.
+2. **Playwright bot** (`npm run export`) — **does not use the extension.** It opens the dashboard search URL (e.g. [`/dashboard/search?location=United%20States`](https://contactout.com/dashboard/search?location=United%20States)), logs in only if needed, then for each page loads `…&page=1`, `…&page=2`, … (incrementing `page` by 1), runs the **same DOM scrape** as the extension (see `scripts/contactout-scrape-dom-eval.js`), and saves a JSON file per page. It records completed `page=` values in **`data/search-history.json`** (per search URL) so **re-runs skip pages already exported**. After each run it writes **`contactout-merged-*.json`** in the **`data/`** folder (same directory as `search-history.json`) — one deduplicated file (by LinkedIn URL) combining **all rows collected in that run** from the per-page JSON files.
 
 ## Requirements
 
@@ -39,7 +39,7 @@ npm run export -- --random-search --random-seed=42
 
 See **`SEARCH_RANDOM`**, **`SEARCH_RANDOM_SEED`**, and **`SEARCH_PROFILE`** in the table below. **`CONTACTOUT_SEARCH_URL`** in `.env` overrides presets and random picks when set.
 
-By default the browser window is visible. Set `HEADLESS=1` to run headless. **Per-page** CSVs go under `exports/`; the **merged** CSV goes under `data/` next to `search-history.json`. Exported CSV filenames include sanitized `SEARCH_KEYWORD`, `SEARCH_TITLE`, and `SEARCH_GENDER` values when present; empty values are omitted from the filename.
+By default the browser window is visible. Set `HEADLESS=1` to run headless. **Per-page** JSON files go under `exports/`; the **merged** JSON goes under `data/` next to `search-history.json`. Exported filenames include sanitized `SEARCH_KEYWORD`, `SEARCH_TITLE`, and `SEARCH_GENDER` values when present; empty values are omitted from the filename.
 
 ## Environment variables
 
@@ -56,14 +56,15 @@ By default the browser window is visible. Set `HEADLESS=1` to run headless. **Pe
 | `SEARCH_RANDOM` | No | Set `1` / `true`: pick one random value per key from **`search_params.pools`** and merge **`default_extra`** (e.g. `login=success`). Disabled if you use **`--search-profile=`** on the CLI |
 | `SEARCH_RANDOM_SEED` | No | Optional integer so **`SEARCH_RANDOM`** picks are reproducible; same as **`--random-seed=`** |
 | `SEARCH_KEYWORD` | No | Fallback label/location string if `CONTACTOUT_LOCATION` is unset (legacy alias) |
-| `SEARCH_TITLE` | No | Optional title filter added to generated search URLs; also included in exported CSV filenames when set |
-| `SEARCH_GENDER` | No | Optional gender filter added to generated search URLs; also included in exported CSV filenames when set. If empty, it is omitted from the filename |
+| `SEARCH_TITLE` | No | Optional title filter added to generated search URLs; also included in exported JSON filenames when set |
+| `SEARCH_GENDER` | No | Optional gender filter added to generated search URLs; also included in exported JSON filenames when set. If empty, it is omitted from the filename |
 | `START_PAGE` | No | First `page=` to load (default `1`). Use `4` to start at `…&page=4` |
 | `MAX_PAGES` | No | How many URLs to export: `page=START_PAGE`, `START_PAGE+1`, … (default `10`). Set `0` to keep increasing `page` until a page returns no rows |
-| `EXPORT_DIR` | No | Output directory for CSVs (default: `./exports`) |
-| `SEARCH_HISTORY_PATH` | No | JSON file tracking which `page=` values finished per search (default: `./data/search-history.json`). The merged CSV is written to the **same directory** as this file |
+| `EXPORT_DIR` | No | Output directory for per-page JSON files (default: `./exports`) |
+| `SEARCH_HISTORY_PATH` | No | JSON file tracking which `page=` values finished per search (default: `./data/search-history.json`). The merged JSON is written to the **same directory** as this file |
 | `IGNORE_SEARCH_HISTORY` | No | Set `1` or `true` to ignore history and re-download every page |
-| `MERGE_CSV` | No | Set `0` or `false` to skip writing the combined `contactout-merged-*.csv` at the end of a run |
+| `MERGE_JSON` | No | Set `0` or `false` to skip writing the combined `contactout-merged-*.json` at the end of a run |
+| `MERGE_CSV` | No | Legacy alias for `MERGE_JSON` |
 | `STOP_ON_DUPLICATE_PAGE` | No | Default **on**: if page **N** returns the **same people** as page **N−1** (ContactOut often caps pagination and repeats the last page), the bot **stops without writing** that duplicate and tells you to change **`SEARCH_KEYWORD`**, **`CONTACTOUT_LOCATION`**, **`SEARCH_PROFILE`**, or **`CONTACTOUT_SEARCH_URL`**. Set `0` / `false` to disable |
 | `HEADLESS` | No | Set to `1` or `true` to run Chromium headless |
 | `PROXIES` | No | **JSON array**, bracket list, or one URL per line. If **`PROXIES_FILE`** is set too, both are **merged** (deduped) |

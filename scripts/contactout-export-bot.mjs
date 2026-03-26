@@ -2,7 +2,7 @@
 /**
  * Opens people search (United States by default); logs in only if redirected to /login.
  * Scrapes each result page in the browser with the same DOM logic as the ContactOut
- * extension (see scripts/contactout-scrape-dom-eval.js), writes CSVs, then paginates.
+ * extension (see scripts/contactout-scrape-dom-eval.js), writes JSON files, then paginates.
  *
  * No Chrome extension required — Playwright evaluates the scrape bundle in-page.
  *
@@ -19,7 +19,8 @@
  *   EXPORT_DIR — default ./exports
  *   SEARCH_HISTORY_PATH — default ./data/search-history.json (tracks completed pages per search)
  *   IGNORE_SEARCH_HISTORY — set "1" to re-download every page
- *   MERGE_CSV — set "0" to skip writing one combined CSV at the end of a run
+ *   MERGE_JSON — set "0" to skip writing one combined JSON file at the end of a run
+ *   MERGE_CSV — legacy alias for MERGE_JSON
  *   STOP_ON_DUPLICATE_PAGE — if not "0"/"false", stop when page N matches page N−1
  *     (ContactOut often repeats the last page forever). Then change SEARCH_KEYWORD /
  *     CONTACTOUT_LOCATI ON / CONTACTOUT_SEARCH_URL and re-run (default: on)
@@ -39,7 +40,7 @@
  *     -h, --help — print options and exit
  *
  *   CONTACTOUT_SEARCH_URL always wins over profile / random when set.
- *   Merged CSV path: same folder as search history (default ./data/), not EXPORT_DIR
+ *   Merged JSON path: same folder as search history (default ./data/), not EXPORT_DIR
  *   HEADLESS — set "1" or "true" for headless Chromium (optional)
  *
  *   Proxy (optional; uses launch()+context instead of persistent profile):
@@ -90,20 +91,8 @@ function loadScrapeDomEval() {
   scrapeDomEvalSource = fs.readFileSync(SCRAPE_DOM_EVAL_PATH, "utf8");
 }
 
-function toCsvValue(s) {
-  const v = String(s ?? "");
-  if (/[",\r\n]/.test(v)) return `"${v.replace(/"/g, '""')}"`;
-  return v;
-}
-
-function buildCsv(rows) {
-  const lines = ["Full Name,Linkedin profile link,Work email domain"];
-  for (const r of rows) {
-    lines.push(
-      `${toCsvValue(r.fullName)},${toCsvValue(r.linkedinUrl)},${toCsvValue(r.workEmailDomain)}`
-    );
-  }
-  return "\uFEFF" + lines.join("\r\n");
+function buildJson(rows) {
+  return JSON.stringify(rows, null, 2) + "\n";
 }
 
 function sanitizeFilenamePart(value) {
@@ -128,6 +117,11 @@ function buildExportNameSuffix() {
     sanitizeFilenamePart(gender),
   ].filter(Boolean);
   return parts.length ? `-${parts.join("-")}` : "";
+}
+
+function isEnvFalse(name) {
+  const value = process.env[name];
+  return value === "0" || value === "false";
 }
 
 function requireEnv(name) {
@@ -593,7 +587,7 @@ function parseStartPageEnv() {
 }
 
 /**
- * Runs the bundled IIFE in the page context (same output as the extension popup CSV).
+ * Runs the bundled IIFE in the page context (same row shape as the extension popup export).
  */
 async function scrapeCurrentPageRows(page) {
   const code = scrapeDomEvalSource;
@@ -1087,8 +1081,10 @@ async function main() {
   const ignoreSearchHistory =
     process.env.IGNORE_SEARCH_HISTORY === "1" ||
     process.env.IGNORE_SEARCH_HISTORY === "true";
-  const mergeCsv =
-    process.env.MERGE_CSV !== "0" && process.env.MERGE_CSV !== "false";
+  const mergeJson =
+    process.env.MERGE_JSON != null
+      ? !isEnvFalse("MERGE_JSON")
+      : !isEnvFalse("MERGE_CSV");
 
   const emailPool = parseEmailPoolFromEnv();
   if (!emailPool.length) {
@@ -1354,14 +1350,14 @@ async function main() {
 
     let lastPaginationFingerprint = "";
 
-    const exportPageToCsv = (pageNum, urlThis, rows) => {
-      const csv = buildCsv(rows);
+    const exportPageToJson = (pageNum, urlThis, rows) => {
+      const json = buildJson(rows);
       const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
       const outPath = path.join(
         exportDir,
-        `contactout-page-${String(pageNum).padStart(4, "0")}${exportNameSuffix}-${stamp}.csv`
+        `contactout-page-${String(pageNum).padStart(4, "0")}${exportNameSuffix}-${stamp}.json`
       );
-      fs.writeFileSync(outPath, csv, "utf8");
+      fs.writeFileSync(outPath, json, "utf8");
       console.log(
         `[contactout-bot] URL page=${pageNum} (${urlThis}): wrote ${rows.length} row(s) -> ${outPath}`
       );
@@ -1415,13 +1411,13 @@ async function main() {
         ) {
           console.warn(
             `[contactout-bot] Page ${pageNum} is identical to the previous page (pagination stuck). ` +
-              `Not writing CSV. Update SEARCH_KEYWORD, CONTACTOUT_LOCATION, SEARCH_PROFILE / --random-search (search_keywords.json), or CONTACTOUT_SEARCH_URL / filters for a new slice of results, then re-run (or set STOP_ON_DUPLICATE_PAGE=0 to ignore).`
+              `Not writing JSON. Update SEARCH_KEYWORD, CONTACTOUT_LOCATION, SEARCH_PROFILE / --random-search (search_keywords.json), or CONTACTOUT_SEARCH_URL / filters for a new slice of results, then re-run (or set STOP_ON_DUPLICATE_PAGE=0 to ignore).`
           );
           return { duplicate: true, rows };
         }
         lastPaginationFingerprint = fp;
 
-        exportPageToCsv(pageNum, urlThis, rows);
+        exportPageToJson(pageNum, urlThis, rows);
         rowsForMerge.push(...rows);
         if (!ignoreSearchHistory) {
           markPageCompleted(history, searchId, searchBaseUrl, pageNum);
@@ -1474,20 +1470,20 @@ async function main() {
       console.log(`[contactout-bot] Finished page range (MAX_PAGES=${maxPages}).`);
     }
 
-    if (mergeCsv && rowsForMerge.length > 0) {
+    if (mergeJson && rowsForMerge.length > 0) {
       const merged = dedupeRowsByLinkedin(rowsForMerge);
       const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
       const mergedPath = path.join(
         dataDir,
-        `contactout-merged-${searchId.slice(0, 8)}${exportNameSuffix}-${stamp}.csv`
+        `contactout-merged-${searchId.slice(0, 8)}${exportNameSuffix}-${stamp}.json`
       );
-      fs.writeFileSync(mergedPath, buildCsv(merged), "utf8");
+      fs.writeFileSync(mergedPath, buildJson(merged), "utf8");
       console.log(
         `[contactout-bot] Merged ${rowsForMerge.length} row(s) from this run → ${merged.length} unique → ${mergedPath}`
       );
-    } else if (mergeCsv) {
+    } else if (mergeJson) {
       console.log(
-        "[contactout-bot] No new rows this run; merged CSV not written."
+        "[contactout-bot] No new rows this run; merged JSON not written."
       );
     }
   } finally {
