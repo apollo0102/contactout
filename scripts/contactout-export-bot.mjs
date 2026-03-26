@@ -31,6 +31,8 @@
  *   SEARCH_PROFILE — id in search_params.presets[] or saved_searches[] (when CONTACTOUT_SEARCH_URL unset)
  *   SEARCH_TITLE — optional title filter added to generated search URLs
  *   SEARCH_GENDER — optional gender filter added to generated search URLs
+ *   SEARCH_GENDER_LIST — optional JSON / bracket list / comma/newline list of genders;
+ *     runs one search per gender and merges all rows into one final JSON
  *   SEARCH_RANDOM — set "1"/"true" to pick one value per key from search_params.pools (company, job_function,
  *     location, seniority, title, totalYears or total_years, years, login, …); merged with default_extra
  *   SEARCH_RANDOM_SEED — optional integer for reproducible random picks
@@ -107,13 +109,41 @@ function sanitizeFilenamePart(value) {
     .slice(0, 80);
 }
 
-function buildExportNameSuffix() {
+function parseSearchGenderListEnv() {
+  const raw = process.env.SEARCH_GENDER_LIST?.trim();
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return [...new Set(parsed.map((s) => String(s).trim()).filter(Boolean))];
+    }
+  } catch {
+    /* fall through */
+  }
+  return [
+    ...new Set(
+      raw
+        .split(/[\n,]+/)
+        .map((s) => String(s).trim().replace(/^['"]|['"]$/g, ""))
+        .filter(Boolean)
+    ),
+  ];
+}
+
+function normalizeGenderValue(value) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function buildExportNameSuffix(options = {}) {
   const keyword =
     process.env.SEARCH_KEYWORD?.trim() ||
     process.env.CONTACTOUT_LOCATION?.trim() ||
     "";
   const title = process.env.SEARCH_TITLE?.trim() || "";
-  const gender = process.env.SEARCH_GENDER?.trim() || "";
+  const gender =
+    options.gender !== undefined
+      ? normalizeGenderValue(options.gender || "")
+      : normalizeGenderValue(process.env.SEARCH_GENDER?.trim() || "");
   const parts = [
     sanitizeFilenamePart(keyword),
     sanitizeFilenamePart(title),
@@ -609,6 +639,17 @@ function buildSearchUrlWithPage(baseUrl, pageNum) {
   return u.toString();
 }
 
+function setSearchParam(searchUrl, key, value) {
+  const u = new URL(searchUrl, "https://contactout.com");
+  if (value === undefined || value === null || String(value).trim() === "") {
+    u.searchParams.delete(key);
+  } else {
+    u.searchParams.set(key, String(value).trim());
+  }
+  u.searchParams.delete("page");
+  return u.toString();
+}
+
 /**
  * First `page=` query value (default 1). Use e.g. 4 to resume at
  * ...&page=4
@@ -840,7 +881,7 @@ function resolveSearchUrlAndLocation(ROOT, cli) {
     process.env.CONTACTOUT_LOCATION?.trim() ||
     process.env.SEARCH_KEYWORD?.trim();
   const envTitle = process.env.SEARCH_TITLE?.trim();
-  const envGender = process.env.SEARCH_GENDER?.trim();
+  const envGender = normalizeGenderValue(process.env.SEARCH_GENDER?.trim());
   const defaultLocation = envLocation || "United States";
   const envFlatParams = {
     ...(envLocation ? { location: envLocation } : {}),
@@ -871,7 +912,7 @@ function resolveSearchUrlAndLocation(ROOT, cli) {
       ? presetObjectToFlatParams(
           /** @type {Record<string, unknown>} */ (sp.default_extra)
         )
-      : {};
+      : { login: "success" };
 
   const wantRandom =
     Boolean(cli?.randomSearch) ||
@@ -989,12 +1030,55 @@ function resolveSearchUrlAndLocation(ROOT, cli) {
     location: defaultLocation,
     searchUrlRaw: buildContactOutSearchUrl(
       {
+        ...defaultExtra,
         location: defaultLocation,
         ...(envTitle ? { title: envTitle } : {}),
         ...(envGender ? { gender: envGender } : {}),
       },
       baseFromFile
     ),
+  };
+}
+
+function buildSearchPlans(ROOT, cli) {
+  const basePlan = resolveSearchUrlAndLocation(ROOT, cli);
+  const genderList = parseSearchGenderListEnv();
+  if (genderList.length <= 1) {
+    const gender = normalizeGenderValue(
+      genderList[0] || process.env.SEARCH_GENDER?.trim() || ""
+    );
+    const searchUrlRaw = gender
+      ? setSearchParam(basePlan.searchUrlRaw, "gender", gender)
+      : basePlan.searchUrlRaw;
+    return {
+      plans: [
+        {
+          location: basePlan.location,
+          searchUrlRaw,
+          exportNameSuffix: buildExportNameSuffix({ gender }),
+          gender,
+        },
+      ],
+      mergedSearchId: searchIdFromBaseUrl(normalizeSearchBaseUrl(searchUrlRaw)),
+      mergedExportNameSuffix: buildExportNameSuffix({ gender }),
+    };
+  }
+
+  const baseMergedUrl = normalizeSearchBaseUrl(
+    setSearchParam(basePlan.searchUrlRaw, "gender", "")
+  );
+  return {
+    plans: genderList.map((gender) => {
+      const normalizedGender = normalizeGenderValue(gender);
+      return {
+      location: basePlan.location,
+      searchUrlRaw: setSearchParam(basePlan.searchUrlRaw, "gender", normalizedGender),
+      exportNameSuffix: buildExportNameSuffix({ gender: normalizedGender }),
+      gender: normalizedGender,
+    };
+    }),
+    mergedSearchId: searchIdFromBaseUrl(baseMergedUrl),
+    mergedExportNameSuffix: buildExportNameSuffix({ gender: "all-genders" }),
   };
 }
 
@@ -1101,10 +1185,8 @@ async function main() {
   );
   fs.mkdirSync(exportDir, { recursive: true });
 
-  const { location, searchUrlRaw } = resolveSearchUrlAndLocation(ROOT, cli);
-  const searchBaseUrl = normalizeSearchBaseUrl(searchUrlRaw);
-  const searchId = searchIdFromBaseUrl(searchBaseUrl);
-  const exportNameSuffix = buildExportNameSuffix();
+  const { plans: searchPlans, mergedSearchId, mergedExportNameSuffix } =
+    buildSearchPlans(ROOT, cli);
   const startPage = parseStartPageEnv();
   const maxPages = parseMaxPagesEnv();
   const unlimitedPages = maxPages === 0;
@@ -1353,7 +1435,199 @@ async function main() {
     throw new Error(`Too many HTTP 429 responses (${label})`);
   }
 
+  let loggedIn = false;
+
+  const runSearchPlan = async (plan) => {
+    const searchBaseUrl = normalizeSearchBaseUrl(plan.searchUrlRaw);
+    const searchId = searchIdFromBaseUrl(searchBaseUrl);
+    const exportNameSuffix = plan.exportNameSuffix;
+    const firstUrl = buildSearchUrlWithPage(searchBaseUrl, startPage);
+    console.log(
+      `[contactout-bot] Starting search${plan.gender ? ` (gender=${plan.gender})` : ""}: ${searchBaseUrl}`
+    );
+    await gotoWith429Retry(
+      firstUrl,
+      `first search page${plan.gender ? ` gender=${plan.gender}` : ""}`
+    );
+
+    if (pathnameLooksLikeLogin(page.url())) {
+      console.log("[contactout-bot] Not logged in; signing inвЂ¦");
+      await login(page, currentEmail(), accountPassword);
+      await gotoWith429Retry(firstUrl, "after login");
+      loggedIn = true;
+    } else if (!loggedIn) {
+      console.log("[contactout-bot] Already logged in; continuing with search.");
+      loggedIn = true;
+    }
+
+    if (rotator) await persistSession();
+
+    if (!urlHasLocationParam(searchBaseUrl)) {
+      await setLocationUnitedStates(page, plan.location);
+      if (rotator) await persistSession();
+    }
+
+    const gotoSearchPage = async (pageNum) => {
+      const urlThis = buildSearchUrlWithPage(searchBaseUrl, pageNum);
+      await gotoWith429Retry(urlThis, `result page=${pageNum}`);
+      if (pathnameLooksLikeLogin(page.url())) {
+        console.log(
+          "[contactout-bot] On login page (e.g. after 429 session reset); signing in againвЂ¦"
+        );
+        await login(page, currentEmail(), accountPassword);
+        await gotoWith429Retry(urlThis, `after re-login page=${pageNum}`);
+        if (rotator) await persistSession();
+      }
+    };
+
+    let lastPaginationFingerprint = "";
+
+    const exportPageToJson = (pageNum, urlThis, rows) => {
+      const json = buildJson(rows);
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+      const outPath = path.join(
+        exportDir,
+        `contactout-page-${String(pageNum).padStart(4, "0")}${exportNameSuffix}-${stamp}.json`
+      );
+      fs.writeFileSync(outPath, json, "utf8");
+      console.log(
+        `[contactout-bot] URL page=${pageNum} (${urlThis}): wrote ${rows.length} row(s) -> ${outPath}`
+      );
+      return outPath;
+    };
+
+    const processPage = async (pageNum) => {
+      const urlThis = buildSearchUrlWithPage(searchBaseUrl, pageNum);
+      if (!ignoreSearchHistory && isPageCompleted(history, searchId, pageNum)) {
+        console.log(
+          `[contactout-bot] Skip page ${pageNum} (already in search history: ${path.basename(historyPath)}).`
+        );
+        return;
+      }
+      for (let attempt = 0; attempt <= emptyPageRetryMax; attempt++) {
+        await gotoSearchPage(pageNum);
+        await sleep(2_000);
+
+        const rows = await scrapeCurrentPageRows(page);
+        if (rows.length === 0) {
+          const pageState = await inspectSearchPageState(page);
+          const looksLikeLogin =
+            pathnameLooksLikeLogin(page.url()) || pageState.hasPasswordInput;
+          const suspiciousEmpty = pageState.blocked || looksLikeLogin || !pageState.noResults;
+
+          if (suspiciousEmpty && attempt < emptyPageRetryMax) {
+            console.warn(
+              `[contactout-bot] Page ${pageNum} returned 0 rows but looks blocked/incomplete; retry ${attempt + 1}/${emptyPageRetryMax}.`
+            );
+            if (rotator) {
+              await recreateProxyContext(
+                pageState.blocked || looksLikeLogin
+                  ? "blocked/empty result page"
+                  : "empty/incomplete result page",
+                { clearSession: pageState.blocked || looksLikeLogin }
+              );
+            } else {
+              await sleep(backoff429);
+            }
+            continue;
+          }
+
+          return { empty: true, rows };
+        }
+
+        const fp = paginationFingerprint(rows);
+        if (
+          envStopOnDuplicatePagination() &&
+          lastPaginationFingerprint &&
+          fp === lastPaginationFingerprint
+        ) {
+          console.warn(
+            `[contactout-bot] Page ${pageNum} is identical to the previous page (pagination stuck). ` +
+              `Not writing JSON. Update SEARCH_KEYWORD, CONTACTOUT_LOCATION, SEARCH_PROFILE / --random-search (search_keywords.json), or CONTACTOUT_SEARCH_URL / filters for a new slice of results, then re-run (or set STOP_ON_DUPLICATE_PAGE=0 to ignore).`
+          );
+          return { duplicate: true, rows };
+        }
+        lastPaginationFingerprint = fp;
+
+        exportPageToJson(pageNum, urlThis, rows);
+        rowsForMerge.push(...rows);
+        if (!ignoreSearchHistory) {
+          markPageCompleted(history, searchId, searchBaseUrl, pageNum);
+          saveSearchHistory(historyPath, history);
+        }
+        if (
+          rotator &&
+          rotator.multi &&
+          rotator.rotateEvery > 0
+        ) {
+          pagesSinceRotate += 1;
+          if (pagesSinceRotate >= rotator.rotateEvery) {
+            pagesSinceRotate = 0;
+            await persistSession();
+            await recreateProxyContext(
+              `PROXY_ROTATE_EVERY=${rotator.rotateEvery} pages`
+            );
+          }
+        }
+        return { empty: false, rows };
+      }
+      return { empty: true, rows: [] };
+    };
+
+    if (unlimitedPages) {
+      for (let pageNum = startPage; ; pageNum++) {
+        const res = await processPage(pageNum);
+        if (res == null) continue;
+        if (res.empty) {
+          console.log(
+            `[contactout-bot] No rows on URL page=${pageNum}; stopping (MAX_PAGES=0).`
+          );
+          break;
+        }
+        if (res.duplicate) break;
+      }
+    } else {
+      for (let i = 0; i < maxPages; i++) {
+        const pageNum = startPage + i;
+        const res = await processPage(pageNum);
+        if (res == null) continue;
+        if (res.empty) {
+          console.log(
+            `[contactout-bot] No rows on URL page=${pageNum}; stopping.`
+          );
+          break;
+        }
+        if (res.duplicate) break;
+      }
+      console.log(
+        `[contactout-bot] Finished page range (MAX_PAGES=${maxPages})${plan.gender ? ` for gender=${plan.gender}` : ""}.`
+      );
+    }
+  };
+
   try {
+    for (const plan of searchPlans) {
+      await runSearchPlan(plan);
+    }
+
+    if (mergeJson && rowsForMerge.length > 0) {
+      const merged = dedupeRowsByLinkedin(rowsForMerge);
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+      const mergedPath = path.join(
+        mergedDir,
+        `contactout-merged-${mergedSearchId.slice(0, 8)}${mergedExportNameSuffix}-${stamp}.json`
+      );
+      fs.writeFileSync(mergedPath, buildJson(merged), "utf8");
+      console.log(
+        `[contactout-bot] Merged ${rowsForMerge.length} row(s) from this run в†’ ${merged.length} unique в†’ ${mergedPath}`
+      );
+    } else if (mergeJson) {
+      console.log(
+        "[contactout-bot] No new rows this run; merged JSON not written."
+      );
+    }
+    return;
+
     const firstUrl = buildSearchUrlWithPage(searchBaseUrl, startPage);
     await gotoWith429Retry(firstUrl, "first search page");
 
