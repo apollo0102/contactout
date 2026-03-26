@@ -84,6 +84,7 @@ const SCRAPE_DOM_EVAL_PATH = path.join(
   "contactout-scrape-dom-eval.js"
 );
 const EMAILS_CONFIG_PATH = path.join(ROOT, "ref", "emails.js");
+const CONSTANTS_CONFIG_PATH = path.join(ROOT, "ref", "constants.js");
 const DEFAULT_PROXIES_FILE = path.join(ROOT, "ref", "proxies.txt");
 
 /** Same DOM scrape as `contactout_extension/content.js` (keep in sync with that file). */
@@ -94,6 +95,18 @@ function loadScrapeDomEval() {
     throw new Error(`Scrape bundle missing: ${SCRAPE_DOM_EVAL_PATH}`);
   }
   scrapeDomEvalSource = fs.readFileSync(SCRAPE_DOM_EVAL_PATH, "utf8");
+}
+
+async function loadConstantsConfigToEnv() {
+  if (!fs.existsSync(CONSTANTS_CONFIG_PATH)) return;
+  const mod = await import(pathToFileURL(CONSTANTS_CONFIG_PATH).href);
+  const config =
+    mod?.default && typeof mod.default === "object" ? mod.default : {};
+  for (const [key, value] of Object.entries(config)) {
+    if (value === undefined || value === null) continue;
+    process.env[key] =
+      typeof value === "string" ? value : JSON.stringify(value);
+  }
 }
 
 function buildJson(rows) {
@@ -193,6 +206,66 @@ function parseSearchEmployeeSizeListEnv() {
   ];
 }
 
+function parseSearchRevenueRangesEnv() {
+  const raw = process.env.SEARCH_REVENUE?.trim();
+  if (!raw) return [];
+
+  const parseArray = (text) => {
+    const parsed = JSON.parse(text);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((item) => item && typeof item === "object" && !Array.isArray(item))
+      .map((item) => ({
+        revenueMin:
+          item.revenue_min === undefined || item.revenue_min === null
+            ? ""
+            : String(item.revenue_min).trim(),
+        revenueMax:
+          item.revenue_max === undefined || item.revenue_max === null
+            ? ""
+            : String(item.revenue_max).trim(),
+      }))
+      .filter((item) => item.revenueMin || item.revenueMax);
+  };
+
+  try {
+    return parseArray(raw);
+  } catch {
+    /* fall through */
+  }
+
+  try {
+    const normalized = raw.replace(
+      /([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)/g,
+      '$1"$2"$3'
+    );
+    return parseArray(normalized);
+  } catch {
+    return [];
+  }
+}
+
+function parseSearchIndustryListEnv() {
+  const raw = process.env.SEARCH_INDUSTRY?.trim();
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return [...new Set(parsed.map((s) => String(s).trim()).filter(Boolean))];
+    }
+  } catch {
+    /* fall through */
+  }
+  return [
+    ...new Set(
+      raw
+        .split(/[\n,]+/)
+        .map((s) => String(s).trim().replace(/^['"]|['"]$/g, ""))
+        .filter(Boolean)
+    ),
+  ];
+}
+
 function normalizeGenderValue(value) {
   return String(value ?? "").trim().toLowerCase();
 }
@@ -217,6 +290,19 @@ function buildExportNameSuffix(options = {}) {
     options.employeeSize !== undefined
       ? String(options.employeeSize || "").trim()
       : "";
+  const revenueMin =
+    options.revenueMin !== undefined
+      ? String(options.revenueMin || "").trim()
+      : "";
+  const revenueMax =
+    options.revenueMax !== undefined
+      ? String(options.revenueMax || "").trim()
+      : "";
+  const industry =
+    options.industry !== undefined ? String(options.industry || "").trim() : "";
+  const revenueLabel = revenueMin || revenueMax
+    ? `revenue-${revenueMin || "min"}-${revenueMax || "plus"}`
+    : "";
   const parts = [
     sanitizeFilenamePart(keyword),
     sanitizeFilenamePart(title),
@@ -224,6 +310,8 @@ function buildExportNameSuffix(options = {}) {
     sanitizeFilenamePart(years ? `years-${years}` : ""),
     sanitizeFilenamePart(totalYears ? `totalyears-${totalYears}` : ""),
     sanitizeFilenamePart(employeeSize ? `employee-size-${employeeSize}` : ""),
+    sanitizeFilenamePart(revenueLabel),
+    sanitizeFilenamePart(industry ? `industry-${industry}` : ""),
   ].filter(Boolean);
   return parts.length ? `-${parts.join("-")}` : "";
 }
@@ -1150,6 +1238,9 @@ function buildSearchPlans(ROOT, cli) {
           years: "",
           totalYears: "",
           employeeSize: "",
+          revenueMin: "",
+          revenueMax: "",
+          industry: "",
         },
       ],
       mergedSearchId: searchIdFromBaseUrl(normalizeSearchBaseUrl(searchUrlRaw)),
@@ -1171,6 +1262,9 @@ function buildSearchPlans(ROOT, cli) {
       years: "",
       totalYears: "",
       employeeSize: "",
+      revenueMin: "",
+      revenueMax: "",
+      industry: "",
     };
     }),
     mergedSearchId: searchIdFromBaseUrl(baseMergedUrl),
@@ -1267,6 +1361,7 @@ async function setLocationUnitedStates(page, locationLabel) {
 }
 
 async function main() {
+  await loadConstantsConfigToEnv();
   loadScrapeDomEval();
 
   const cli = parseCliArgs(process.argv.slice(2));
@@ -1536,6 +1631,8 @@ async function main() {
   const searchYearsList = parseSearchYearsListEnv();
   const searchTotalYearsList = parseSearchTotalYearsListEnv();
   const searchEmployeeSizeList = parseSearchEmployeeSizeListEnv();
+  const searchRevenueRanges = parseSearchRevenueRangesEnv();
+  const searchIndustryList = parseSearchIndustryListEnv();
 
   const runSearchPlan = async (plan) => {
     const searchBaseUrl = normalizeSearchBaseUrl(plan.searchUrlRaw);
@@ -1570,11 +1667,11 @@ async function main() {
     const profileCount = await extractProfileCount(page);
     if (profileCount) {
       console.log(
-        `[contactout-bot] Profile count${plan.gender ? ` for gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}: ${profileCount.total} (${profileCount.summary})`
+        `[contactout-bot] Profile count${plan.gender ? ` for gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}${plan.revenueMin || plan.revenueMax ? ` revenue=${plan.revenueMin || "min"}-${plan.revenueMax || "plus"}` : ""}${plan.industry ? ` industry=${plan.industry}` : ""}: ${profileCount.total} (${profileCount.summary})`
       );
     } else {
       console.log(
-        `[contactout-bot] Profile count${plan.gender ? ` for gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}: not found on page`
+        `[contactout-bot] Profile count${plan.gender ? ` for gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}${plan.revenueMin || plan.revenueMax ? ` revenue=${plan.revenueMin || "min"}-${plan.revenueMax || "plus"}` : ""}${plan.industry ? ` industry=${plan.industry}` : ""}: not found on page`
       );
     }
 
@@ -1651,6 +1748,78 @@ async function main() {
             totalYears,
           }),
           totalYears: String(totalYears).trim(),
+        });
+      }
+      return;
+    }
+
+    if (
+      profileCount &&
+      profileCount.total > searchProfileThreshold &&
+      !(plan.revenueMin || plan.revenueMax) &&
+      searchRevenueRanges.length > 0 &&
+      (
+        plan.employeeSize ||
+        (plan.totalYears && !searchEmployeeSizeList.length) ||
+        (plan.years && !searchTotalYearsList.length && !searchEmployeeSizeList.length) ||
+        (!plan.years && !searchYearsList.length && !searchTotalYearsList.length && !searchEmployeeSizeList.length)
+      )
+    ) {
+      console.log(
+        `[contactout-bot]${plan.gender ? ` gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""} has ${profileCount.total} profiles (> ${searchProfileThreshold}); splitting by revenue: ${searchRevenueRanges.map((range) => `${range.revenueMin || "min"}-${range.revenueMax || "plus"}`).join(", ")}`
+      );
+      for (const range of searchRevenueRanges) {
+        let nextUrl = searchBaseUrl;
+        nextUrl = setSearchParam(nextUrl, "revenue_min", range.revenueMin);
+        nextUrl = setSearchParam(nextUrl, "revenue_max", range.revenueMax);
+        await runSearchPlan({
+          ...plan,
+          searchUrlRaw: nextUrl,
+          exportNameSuffix: buildExportNameSuffix({
+            gender: plan.gender,
+            years: plan.years,
+            totalYears: plan.totalYears,
+            employeeSize: plan.employeeSize,
+            revenueMin: range.revenueMin,
+            revenueMax: range.revenueMax,
+          }),
+          revenueMin: range.revenueMin,
+          revenueMax: range.revenueMax,
+        });
+      }
+      return;
+    }
+
+    if (
+      profileCount &&
+      profileCount.total > searchProfileThreshold &&
+      !plan.industry &&
+      searchIndustryList.length > 0 &&
+      (
+        (plan.revenueMin || plan.revenueMax) ||
+        (plan.employeeSize && !searchRevenueRanges.length) ||
+        (plan.totalYears && !searchEmployeeSizeList.length && !searchRevenueRanges.length) ||
+        (plan.years && !searchTotalYearsList.length && !searchEmployeeSizeList.length && !searchRevenueRanges.length) ||
+        (!plan.years && !searchYearsList.length && !searchTotalYearsList.length && !searchEmployeeSizeList.length && !searchRevenueRanges.length)
+      )
+    ) {
+      console.log(
+        `[contactout-bot]${plan.gender ? ` gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}${plan.revenueMin || plan.revenueMax ? ` revenue=${plan.revenueMin || "min"}-${plan.revenueMax || "plus"}` : ""} has ${profileCount.total} profiles (> ${searchProfileThreshold}); splitting by industry: ${searchIndustryList.join(", ")}`
+      );
+      for (const industry of searchIndustryList) {
+        await runSearchPlan({
+          ...plan,
+          searchUrlRaw: setSearchParam(searchBaseUrl, "industry", industry),
+          exportNameSuffix: buildExportNameSuffix({
+            gender: plan.gender,
+            years: plan.years,
+            totalYears: plan.totalYears,
+            employeeSize: plan.employeeSize,
+            revenueMin: plan.revenueMin,
+            revenueMax: plan.revenueMax,
+            industry,
+          }),
+          industry: String(industry).trim(),
         });
       }
       return;

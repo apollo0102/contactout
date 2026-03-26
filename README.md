@@ -62,6 +62,8 @@ By default the browser window is visible. Set `HEADLESS=1` to run headless. **Pe
 | `SEARCH_YEARS` | No | JSON array, bracket list, or comma/newline list of `years` values. If a gender search count is over `2500`, the bot drills into each `years` item for that gender and merges the results |
 | `SEARCH_TOTALYEARS` | No | JSON array, bracket list, or comma/newline list of `totalYears` values. If a `gender + years` bucket is still over `2500`, the bot drills into each `totalYears` item for that branch and merges the results |
 | `SEARCH_EMPLOYEE_SIZE` | No | JSON array, bracket list, or comma/newline list of `employee_size` values. If a `gender + years + totalYears` bucket is still over `2500`, the bot drills into each `employee_size` item for that branch and merges the results |
+| `SEARCH_REVENUE` | No | Array of objects with `revenue_min` / `revenue_max`. If a `gender + years + totalYears + employee_size` bucket is still over `2500`, the bot drills into each revenue range for that branch and merges the results |
+| `SEARCH_INDUSTRY` | No | JSON array, bracket list, or comma/newline list of industries. If a `gender + years + totalYears + employee_size + revenue` bucket is still over `2500`, the bot drills into each industry value for that branch and merges the results |
 | `START_PAGE` | No | First `page=` to load (default `1`). Use `4` to start at `…&page=4` |
 | `MAX_PAGES` | No | How many URLs to export: `page=START_PAGE`, `START_PAGE+1`, … (default `10`). Set `0` to keep increasing `page` until a page returns no rows |
 | `EXPORT_DIR` | No | Output directory for per-page JSON files (default: `./exports`) |
