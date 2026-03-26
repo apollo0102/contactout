@@ -7,9 +7,11 @@
  * No Chrome extension required — Playwright evaluates the scrape bundle in-page.
  *
  * Env (see .env):
- *   CONTACTOUT_PASSWORD — login when needed (same for all accounts)
- *   EMAIL_USER — one account; or EMAIL_USER1, EMAIL_USER2, … (same password for all)
- *   EMAIL_USERS — optional comma/newline list alternative to numbered vars
+ *   Account config — default ./ref/emails.js exporting EMAIL_USER_LIST and
+ *     CONTACTOUT_PASSWORD (shared password for all accounts)
+ *   CONTACTOUT_PASSWORD — fallback when account config file is absent
+ *   EMAIL_USER — fallback one account; or EMAIL_USER1, EMAIL_USER2, … (same password for all)
+ *   EMAIL_USERS — fallback comma/newline list alternative to numbered vars
  *   On HTTP 429 with multiple emails, the bot advances to the next email and clears
  *     session (cookies + storage-state when using proxies) before re-login.
  *   CONTACTOUT_LOCATION — default "United States"
@@ -17,7 +19,7 @@
  *   START_PAGE — first `page=` in the URL (default 1)
  *   MAX_PAGES — how many pages to export (default 10). `0` = keep incrementing `page` until a scrape returns 0 rows
  *   EXPORT_DIR — default ./exports
- *   SEARCH_HISTORY_PATH — default ./data/search-history.json (tracks completed pages per search)
+ *   SEARCH_HISTORY_PATH — default ./ref/search-history.json (tracks completed pages per search)
  *   IGNORE_SEARCH_HISTORY — set "1" to re-download every page
  *   MERGE_JSON — set "0" to skip writing one combined JSON file at the end of a run
  *   MERGE_CSV — legacy alias for MERGE_JSON
@@ -69,7 +71,7 @@ import "dotenv/config";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { chromium, request as apiRequest } from "playwright";
 import ProxyChain from "proxy-chain";
 
@@ -79,6 +81,7 @@ const SCRAPE_DOM_EVAL_PATH = path.join(
   __dirname,
   "contactout-scrape-dom-eval.js"
 );
+const EMAILS_CONFIG_PATH = path.join(ROOT, "ref", "emails.js");
 const DEFAULT_PROXIES_FILE = path.join(ROOT, "ref", "proxies.txt");
 
 /** Same DOM scrape as `contactout_extension/content.js` (keep in sync with that file). */
@@ -124,12 +127,6 @@ function isEnvFalse(name) {
   return value === "0" || value === "false";
 }
 
-function requireEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env ${name}`);
-  return v;
-}
-
 /**
  * EMAIL_USERS (comma/newline), or EMAIL_USER1, EMAIL_USER2, … in numeric order,
  * or a single EMAIL_USER.
@@ -159,6 +156,44 @@ function parseEmailPoolFromEnv() {
   const single = process.env.EMAIL_USER?.trim();
   if (single) return [single];
   return [];
+}
+
+async function loadAccountsConfig() {
+  if (fs.existsSync(EMAILS_CONFIG_PATH)) {
+    const mod = await import(pathToFileURL(EMAILS_CONFIG_PATH).href);
+    const emailPool = Array.isArray(mod.EMAIL_USER_LIST)
+      ? [...new Set(mod.EMAIL_USER_LIST.map((s) => String(s).trim()).filter(Boolean))]
+      : [];
+    const password =
+      typeof mod.CONTACTOUT_PASSWORD === "string"
+        ? mod.CONTACTOUT_PASSWORD.trim()
+        : "";
+    if (!emailPool.length) {
+      throw new Error(
+        `Account config file is missing EMAIL_USER_LIST entries: ${EMAILS_CONFIG_PATH}`
+      );
+    }
+    if (!password) {
+      throw new Error(
+        `Account config file is missing CONTACTOUT_PASSWORD: ${EMAILS_CONFIG_PATH}`
+      );
+    }
+    return { emailPool, password, source: EMAILS_CONFIG_PATH };
+  }
+
+  const emailPool = parseEmailPoolFromEnv();
+  const password = process.env.CONTACTOUT_PASSWORD?.trim() || "";
+  if (!emailPool.length) {
+    throw new Error(
+      `No login email: create ${EMAILS_CONFIG_PATH} or set EMAIL_USER, EMAIL_USERS, or EMAIL_USER1, EMAIL_USER2, …`
+    );
+  }
+  if (!password) {
+    throw new Error(
+      `No login password: create ${EMAILS_CONFIG_PATH} or set CONTACTOUT_PASSWORD`
+    );
+  }
+  return { emailPool, password, source: "environment variables" };
 }
 
 function sleep(ms) {
@@ -976,10 +1011,12 @@ function envHeadless() {
   return h === "1" || h === "true" || h === "yes";
 }
 
-async function login(page, email) {
-  const password = requireEnv("CONTACTOUT_PASSWORD");
+async function login(page, email, password) {
   if (!email || !String(email).trim()) {
     throw new Error("Missing login email");
+  }
+  if (!password || !String(password).trim()) {
+    throw new Error("Missing login password");
   }
 
   if (!pathnameLooksLikeLogin(page.url())) {
@@ -1073,10 +1110,12 @@ async function main() {
   const unlimitedPages = maxPages === 0;
 
   const historyPath = path.resolve(
-    process.env.SEARCH_HISTORY_PATH || path.join(ROOT, "data", "search-history.json")
+    process.env.SEARCH_HISTORY_PATH || path.join(ROOT, "ref", "search-history.json")
   );
-  const dataDir = path.dirname(historyPath);
-  fs.mkdirSync(dataDir, { recursive: true });
+  const historyDir = path.dirname(historyPath);
+  const mergedDir = path.join(ROOT, "data");
+  fs.mkdirSync(historyDir, { recursive: true });
+  fs.mkdirSync(mergedDir, { recursive: true });
 
   const ignoreSearchHistory =
     process.env.IGNORE_SEARCH_HISTORY === "1" ||
@@ -1086,12 +1125,10 @@ async function main() {
       ? !isEnvFalse("MERGE_JSON")
       : !isEnvFalse("MERGE_CSV");
 
-  const emailPool = parseEmailPoolFromEnv();
-  if (!emailPool.length) {
-    throw new Error(
-      "No login email: set EMAIL_USER, EMAIL_USERS, or EMAIL_USER1, EMAIL_USER2, …"
-    );
-  }
+  const accountConfig = await loadAccountsConfig();
+  const emailPool = accountConfig.emailPool;
+  const accountPassword = accountConfig.password;
+  console.log(`[auth] Loaded accounts from ${accountConfig.source}`);
   let emailIndex = 0;
   const currentEmail = () => emailPool[emailIndex % emailPool.length];
   if (emailPool.length > 1) {
@@ -1322,7 +1359,7 @@ async function main() {
 
     if (pathnameLooksLikeLogin(page.url())) {
       console.log("[contactout-bot] Not logged in; signing in…");
-      await login(page, currentEmail());
+      await login(page, currentEmail(), accountPassword);
       await gotoWith429Retry(firstUrl, "after login");
     } else {
       console.log("[contactout-bot] Already logged in; continuing with search.");
@@ -1342,7 +1379,7 @@ async function main() {
         console.log(
           "[contactout-bot] On login page (e.g. after 429 session reset); signing in again…"
         );
-        await login(page, currentEmail());
+        await login(page, currentEmail(), accountPassword);
         await gotoWith429Retry(urlThis, `after re-login page=${pageNum}`);
         if (rotator) await persistSession();
       }
@@ -1474,7 +1511,7 @@ async function main() {
       const merged = dedupeRowsByLinkedin(rowsForMerge);
       const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
       const mergedPath = path.join(
-        dataDir,
+        mergedDir,
         `contactout-merged-${searchId.slice(0, 8)}${exportNameSuffix}-${stamp}.json`
       );
       fs.writeFileSync(mergedPath, buildJson(merged), "utf8");

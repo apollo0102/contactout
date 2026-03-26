@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "searches": {
+    "a039985b09ae1df72de85aa6": {
+      "canonicalBaseUrl": "https://contactout.com/dashboard/search?location=United%20States",
+      "pagesCompleted": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13
+      ],
+      "lastUpdated": "2026-03-25T14:13:39.041Z"
+    },
+    "b8227c5335c000b6d2ff1b13": {
+      "canonicalBaseUrl": "https://contactout.com/dashboard/search?gender=male&location=United%20States&title=Director%20of%20Strategy",
+      "pagesCompleted": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20
+      ],
+      "lastUpdated": "2026-03-25T15:31:10.185Z"
+    }
+  }
+}
