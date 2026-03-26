@@ -151,6 +151,48 @@ function parseSearchYearsListEnv() {
   ];
 }
 
+function parseSearchTotalYearsListEnv() {
+  const raw = process.env.SEARCH_TOTALYEARS?.trim();
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return [...new Set(parsed.map((s) => String(s).trim()).filter(Boolean))];
+    }
+  } catch {
+    /* fall through */
+  }
+  return [
+    ...new Set(
+      raw
+        .split(/[\n,]+/)
+        .map((s) => String(s).trim().replace(/^['"]|['"]$/g, ""))
+        .filter(Boolean)
+    ),
+  ];
+}
+
+function parseSearchEmployeeSizeListEnv() {
+  const raw = process.env.SEARCH_EMPLOYEE_SIZE?.trim();
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return [...new Set(parsed.map((s) => String(s).trim()).filter(Boolean))];
+    }
+  } catch {
+    /* fall through */
+  }
+  return [
+    ...new Set(
+      raw
+        .split(/[\n,]+/)
+        .map((s) => String(s).trim().replace(/^['"]|['"]$/g, ""))
+        .filter(Boolean)
+    ),
+  ];
+}
+
 function normalizeGenderValue(value) {
   return String(value ?? "").trim().toLowerCase();
 }
@@ -167,11 +209,21 @@ function buildExportNameSuffix(options = {}) {
       : normalizeGenderValue(process.env.SEARCH_GENDER?.trim() || "");
   const years =
     options.years !== undefined ? String(options.years || "").trim() : "";
+  const totalYears =
+    options.totalYears !== undefined
+      ? String(options.totalYears || "").trim()
+      : "";
+  const employeeSize =
+    options.employeeSize !== undefined
+      ? String(options.employeeSize || "").trim()
+      : "";
   const parts = [
     sanitizeFilenamePart(keyword),
     sanitizeFilenamePart(title),
     sanitizeFilenamePart(gender),
     sanitizeFilenamePart(years ? `years-${years}` : ""),
+    sanitizeFilenamePart(totalYears ? `totalyears-${totalYears}` : ""),
+    sanitizeFilenamePart(employeeSize ? `employee-size-${employeeSize}` : ""),
   ].filter(Boolean);
   return parts.length ? `-${parts.join("-")}` : "";
 }
@@ -1096,6 +1148,8 @@ function buildSearchPlans(ROOT, cli) {
           exportNameSuffix: buildExportNameSuffix({ gender }),
           gender,
           years: "",
+          totalYears: "",
+          employeeSize: "",
         },
       ],
       mergedSearchId: searchIdFromBaseUrl(normalizeSearchBaseUrl(searchUrlRaw)),
@@ -1115,6 +1169,8 @@ function buildSearchPlans(ROOT, cli) {
       exportNameSuffix: buildExportNameSuffix({ gender: normalizedGender }),
       gender: normalizedGender,
       years: "",
+      totalYears: "",
+      employeeSize: "",
     };
     }),
     mergedSearchId: searchIdFromBaseUrl(baseMergedUrl),
@@ -1478,6 +1534,8 @@ async function main() {
   let loggedIn = false;
   const searchProfileThreshold = 2500;
   const searchYearsList = parseSearchYearsListEnv();
+  const searchTotalYearsList = parseSearchTotalYearsListEnv();
+  const searchEmployeeSizeList = parseSearchEmployeeSizeListEnv();
 
   const runSearchPlan = async (plan) => {
     const searchBaseUrl = normalizeSearchBaseUrl(plan.searchUrlRaw);
@@ -1512,11 +1570,11 @@ async function main() {
     const profileCount = await extractProfileCount(page);
     if (profileCount) {
       console.log(
-        `[contactout-bot] Profile count${plan.gender ? ` for gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}: ${profileCount.total} (${profileCount.summary})`
+        `[contactout-bot] Profile count${plan.gender ? ` for gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}: ${profileCount.total} (${profileCount.summary})`
       );
     } else {
       console.log(
-        `[contactout-bot] Profile count${plan.gender ? ` for gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}: not found on page`
+        `[contactout-bot] Profile count${plan.gender ? ` for gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}: not found on page`
       );
     }
 
@@ -1538,6 +1596,61 @@ async function main() {
             years,
           }),
           years: String(years).trim(),
+        });
+      }
+      return;
+    }
+
+    if (
+      profileCount &&
+      profileCount.total > searchProfileThreshold &&
+      !plan.employeeSize &&
+      searchEmployeeSizeList.length > 0 &&
+      (
+        plan.totalYears ||
+        (plan.years && !searchTotalYearsList.length) ||
+        (!plan.years && !searchYearsList.length && !searchTotalYearsList.length)
+      )
+    ) {
+      console.log(
+        `[contactout-bot]${plan.gender ? ` gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""} has ${profileCount.total} profiles (> ${searchProfileThreshold}); splitting by employee_size: ${searchEmployeeSizeList.join(", ")}`
+      );
+      for (const employeeSize of searchEmployeeSizeList) {
+        await runSearchPlan({
+          ...plan,
+          searchUrlRaw: setSearchParam(searchBaseUrl, "employee_size", employeeSize),
+          exportNameSuffix: buildExportNameSuffix({
+            gender: plan.gender,
+            years: plan.years,
+            totalYears: plan.totalYears,
+            employeeSize,
+          }),
+          employeeSize: String(employeeSize).trim(),
+        });
+      }
+      return;
+    }
+
+    if (
+      profileCount &&
+      profileCount.total > searchProfileThreshold &&
+      !plan.totalYears &&
+      searchTotalYearsList.length > 0 &&
+      (plan.years || !searchYearsList.length)
+    ) {
+      console.log(
+        `[contactout-bot]${plan.gender ? ` gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""} has ${profileCount.total} profiles (> ${searchProfileThreshold}); splitting by totalYears: ${searchTotalYearsList.join(", ")}`
+      );
+      for (const totalYears of searchTotalYearsList) {
+        await runSearchPlan({
+          ...plan,
+          searchUrlRaw: setSearchParam(searchBaseUrl, "totalYears", totalYears),
+          exportNameSuffix: buildExportNameSuffix({
+            gender: plan.gender,
+            years: plan.years,
+            totalYears,
+          }),
+          totalYears: String(totalYears).trim(),
         });
       }
       return;
