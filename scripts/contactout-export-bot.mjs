@@ -316,6 +316,52 @@ function buildExportNameSuffix(options = {}) {
   return parts.length ? `-${parts.join("-")}` : "";
 }
 
+function buildExportFolderParts(options = {}) {
+  const keyword =
+    process.env.SEARCH_KEYWORD?.trim() ||
+    process.env.CONTACTOUT_LOCATION?.trim() ||
+    "";
+  const title = process.env.SEARCH_TITLE?.trim() || "";
+  const gender =
+    options.gender !== undefined
+      ? normalizeGenderValue(options.gender || "")
+      : normalizeGenderValue(process.env.SEARCH_GENDER?.trim() || "");
+  const years =
+    options.years !== undefined ? String(options.years || "").trim() : "";
+  const totalYears =
+    options.totalYears !== undefined
+      ? String(options.totalYears || "").trim()
+      : "";
+  const employeeSize =
+    options.employeeSize !== undefined
+      ? String(options.employeeSize || "").trim()
+      : "";
+  const revenueMin =
+    options.revenueMin !== undefined
+      ? String(options.revenueMin || "").trim()
+      : "";
+  const revenueMax =
+    options.revenueMax !== undefined
+      ? String(options.revenueMax || "").trim()
+      : "";
+  const industry =
+    options.industry !== undefined ? String(options.industry || "").trim() : "";
+  const revenueFolder =
+    revenueMin || revenueMax
+      ? `${revenueMin || "min"}-${revenueMax || "plus"}`
+      : "";
+  return [
+    sanitizeFilenamePart(keyword),
+    sanitizeFilenamePart(title),
+    sanitizeFilenamePart(gender),
+    sanitizeFilenamePart(years),
+    sanitizeFilenamePart(totalYears),
+    sanitizeFilenamePart(employeeSize),
+    sanitizeFilenamePart(revenueFolder),
+    sanitizeFilenamePart(industry),
+  ].filter(Boolean);
+}
+
 function isEnvFalse(name) {
   const value = process.env[name];
   return value === "0" || value === "false";
@@ -1638,6 +1684,15 @@ async function main() {
     const searchBaseUrl = normalizeSearchBaseUrl(plan.searchUrlRaw);
     const searchId = searchIdFromBaseUrl(searchBaseUrl);
     const exportNameSuffix = plan.exportNameSuffix;
+    const exportFolderParts = buildExportFolderParts({
+      gender: plan.gender,
+      years: plan.years,
+      totalYears: plan.totalYears,
+      employeeSize: plan.employeeSize,
+      revenueMin: plan.revenueMin,
+      revenueMax: plan.revenueMax,
+      industry: plan.industry,
+    });
     const firstUrl = buildSearchUrlWithPage(searchBaseUrl, startPage);
     console.log(
       `[contactout-bot] Starting search${plan.gender ? ` (gender=${plan.gender})` : ""}: ${searchBaseUrl}`
@@ -1843,8 +1898,10 @@ async function main() {
     const exportPageToJson = (pageNum, urlThis, rows) => {
       const json = buildJson(rows);
       const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+      const outDir = path.join(exportDir, ...exportFolderParts);
+      fs.mkdirSync(outDir, { recursive: true });
       const outPath = path.join(
-        exportDir,
+        outDir,
         `contactout-page-${String(pageNum).padStart(4, "0")}${exportNameSuffix}-${stamp}.json`
       );
       fs.writeFileSync(outPath, json, "utf8");
@@ -1973,7 +2030,7 @@ async function main() {
       const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
       const mergedPath = path.join(
         mergedDir,
-        `contactout-merged-${mergedSearchId.slice(0, 8)}${mergedExportNameSuffix}-${stamp}.json`
+        `contactout-merged-${mergedSearchId.slice(0, 8)}${mergedExportNameSuffix}-items-${merged.length}-${stamp}.json`
       );
       fs.writeFileSync(mergedPath, buildJson(merged), "utf8");
       console.log(
@@ -2144,7 +2201,7 @@ async function main() {
       const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
       const mergedPath = path.join(
         mergedDir,
-        `contactout-merged-${searchId.slice(0, 8)}${exportNameSuffix}-${stamp}.json`
+        `contactout-merged-${searchId.slice(0, 8)}${exportNameSuffix}-items-${merged.length}-${stamp}.json`
       );
       fs.writeFileSync(mergedPath, buildJson(merged), "utf8");
       console.log(

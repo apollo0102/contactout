@@ -45,53 +45,6 @@
         20
       ],
       "lastUpdated": "2026-03-25T15:31:10.185Z"
-    },
-    "715a9bc8c30fe0f569ed4e36": {
-      "canonicalBaseUrl": "https://contactout.com/dashboard/search?employee_size=10001&gender=male&location=United%20States&login=success&revenue_max=1000&revenue_min=0&title=Engineer&totalYears=10_9999&years=0",
-      "pagesCompleted": [
-        1,
-        2
-      ],
-      "lastUpdated": "2026-03-26T16:30:25.808Z"
-    },
-    "50ce09f5b5a29ce003f53d3b": {
-      "canonicalBaseUrl": "https://contactout.com/dashboard/search?employee_size=10001&gender=male&location=United%20States&login=success&revenue_max=5000&revenue_min=1000&title=Engineer&totalYears=10_9999&years=0",
-      "pagesCompleted": [
-        1
-      ],
-      "lastUpdated": "2026-03-26T16:31:34.165Z"
-    },
-    "12269980472d49aea3d7f620": {
-      "canonicalBaseUrl": "https://contactout.com/dashboard/search?employee_size=10001&gender=male&industry=Defense%20%26%20Space&location=United%20States&login=success&revenue_min=1000000&title=Engineer&totalYears=10_9999&years=0",
-      "pagesCompleted": [
-        1,
-        2
-      ],
-      "lastUpdated": "2026-03-26T16:52:11.811Z"
-    },
-    "76b296993ea9fca86c942e01": {
-      "canonicalBaseUrl": "https://contactout.com/dashboard/search?employee_size=10001&gender=male&industry=Computer%20Hardware&location=United%20States&login=success&revenue_min=1000000&title=Engineer&totalYears=10_9999&years=0",
-      "pagesCompleted": [
-        1,
-        2
-      ],
-      "lastUpdated": "2026-03-26T16:52:50.911Z"
-    },
-    "736b9ad8a382e26ca4862c08": {
-      "canonicalBaseUrl": "https://contactout.com/dashboard/search?employee_size=10001&gender=male&industry=Computer%20Software&location=United%20States&login=success&revenue_min=1000000&title=Engineer&totalYears=10_9999&years=0",
-      "pagesCompleted": [
-        1,
-        2
-      ],
-      "lastUpdated": "2026-03-26T16:53:47.294Z"
-    },
-    "14fafd6060f8f19e91dda8e0": {
-      "canonicalBaseUrl": "https://contactout.com/dashboard/search?employee_size=10001&gender=male&industry=Internet&location=United%20States&login=success&revenue_min=1000000&title=Engineer&totalYears=10_9999&years=0",
-      "pagesCompleted": [
-        1,
-        2
-      ],
-      "lastUpdated": "2026-03-26T16:56:33.609Z"
     }
   }
 }
