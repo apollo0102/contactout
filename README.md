@@ -59,6 +59,7 @@ By default the browser window is visible. Set `HEADLESS=1` to run headless. **Pe
 | `SEARCH_TITLE` | No | Optional title filter added to generated search URLs; also included in exported JSON filenames when set |
 | `SEARCH_GENDER` | No | Optional gender filter added to generated search URLs; also included in exported JSON filenames when set. If empty, it is omitted from the filename |
 | `SEARCH_GENDER_LIST` | No | JSON array, bracket list, or comma/newline list of genders. The bot runs one search per gender, keeps separate page files, and merges all rows into one final JSON |
+| `SEARCH_YEARS` | No | JSON array, bracket list, or comma/newline list of `years` values. If a gender search count is over `2500`, the bot drills into each `years` item for that gender and merges the results |
 | `START_PAGE` | No | First `page=` to load (default `1`). Use `4` to start at `…&page=4` |
 | `MAX_PAGES` | No | How many URLs to export: `page=START_PAGE`, `START_PAGE+1`, … (default `10`). Set `0` to keep increasing `page` until a page returns no rows |
 | `EXPORT_DIR` | No | Output directory for per-page JSON files (default: `./exports`) |

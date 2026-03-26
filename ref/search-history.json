@@ -52,7 +52,7 @@
         1,
         2
       ],
-      "lastUpdated": "2026-03-26T11:54:23.782Z"
+      "lastUpdated": "2026-03-26T12:31:42.455Z"
     },
     "5953ace2414865a76e1590d3": {
       "canonicalBaseUrl": "https://contactout.com/dashboard/search?gender=female&location=United%20States&login=success&title=Director%20of%20Strategy",
@@ -60,15 +60,55 @@
         1,
         2
       ],
-      "lastUpdated": "2026-03-26T11:56:06.271Z"
+      "lastUpdated": "2026-03-26T12:33:26.185Z"
     },
-    "e544019c22997fd61e412d2a": {
-      "canonicalBaseUrl": "https://contactout.com/dashboard/search?gender=unknown&location=United%20States&login=success&title=Director%20of%20Strategy",
+    "95b6333f9ef05b2275e0cb18": {
+      "canonicalBaseUrl": "https://contactout.com/dashboard/search?gender=unknown&location=United%20States&login=success&title=Director%20of%20Strategy&years=0",
       "pagesCompleted": [
         1,
         2
       ],
-      "lastUpdated": "2026-03-26T11:57:29.231Z"
+      "lastUpdated": "2026-03-26T12:35:23.971Z"
+    },
+    "3cfcbff1e96e12015265b083": {
+      "canonicalBaseUrl": "https://contactout.com/dashboard/search?gender=unknown&location=United%20States&login=success&title=Director%20of%20Strategy&years=1",
+      "pagesCompleted": [
+        1,
+        2
+      ],
+      "lastUpdated": "2026-03-26T12:35:57.238Z"
+    },
+    "cde7aab10048ee3300251f14": {
+      "canonicalBaseUrl": "https://contactout.com/dashboard/search?gender=unknown&location=United%20States&login=success&title=Director%20of%20Strategy&years=2",
+      "pagesCompleted": [
+        1,
+        2
+      ],
+      "lastUpdated": "2026-03-26T12:36:28.939Z"
+    },
+    "bb1a9b7551b067c85d4fb5c7": {
+      "canonicalBaseUrl": "https://contactout.com/dashboard/search?gender=unknown&location=United%20States&login=success&title=Director%20of%20Strategy&years=3",
+      "pagesCompleted": [
+        1,
+        2
+      ],
+      "lastUpdated": "2026-03-26T12:36:58.156Z"
+    },
+    "6b1160d528512f71e23a3227": {
+      "canonicalBaseUrl": "https://contactout.com/dashboard/search?gender=unknown&location=United%20States&login=success&title=Director%20of%20Strategy&years=4",
+      "pagesCompleted": [
+        1,
+        2
+      ],
+      "lastUpdated": "2026-03-26T12:37:22.815Z"
+    },
+    "e20e6dc6054b9f66710226ad": {
+      "canonicalBaseUrl": "https://contactout.com/dashboard/search?gender=unknown&location=United%20States&login=success&title=Director%20of%20Strategy&years=5",
+      "pagesCompleted": [
+        1,
+        2
+      ],
+      "lastUpdated": "2026-03-26T12:37:48.731Z"
     }
   }
 }

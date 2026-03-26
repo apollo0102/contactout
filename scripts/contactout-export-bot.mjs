@@ -130,6 +130,27 @@ function parseSearchGenderListEnv() {
   ];
 }
 
+function parseSearchYearsListEnv() {
+  const raw = process.env.SEARCH_YEARS?.trim();
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return [...new Set(parsed.map((s) => String(s).trim()).filter(Boolean))];
+    }
+  } catch {
+    /* fall through */
+  }
+  return [
+    ...new Set(
+      raw
+        .split(/[\n,]+/)
+        .map((s) => String(s).trim().replace(/^['"]|['"]$/g, ""))
+        .filter(Boolean)
+    ),
+  ];
+}
+
 function normalizeGenderValue(value) {
   return String(value ?? "").trim().toLowerCase();
 }
@@ -144,10 +165,13 @@ function buildExportNameSuffix(options = {}) {
     options.gender !== undefined
       ? normalizeGenderValue(options.gender || "")
       : normalizeGenderValue(process.env.SEARCH_GENDER?.trim() || "");
+  const years =
+    options.years !== undefined ? String(options.years || "").trim() : "";
   const parts = [
     sanitizeFilenamePart(keyword),
     sanitizeFilenamePart(title),
     sanitizeFilenamePart(gender),
+    sanitizeFilenamePart(years ? `years-${years}` : ""),
   ].filter(Boolean);
   return parts.length ? `-${parts.join("-")}` : "";
 }
@@ -1071,6 +1095,7 @@ function buildSearchPlans(ROOT, cli) {
           searchUrlRaw,
           exportNameSuffix: buildExportNameSuffix({ gender }),
           gender,
+          years: "",
         },
       ],
       mergedSearchId: searchIdFromBaseUrl(normalizeSearchBaseUrl(searchUrlRaw)),
@@ -1089,6 +1114,7 @@ function buildSearchPlans(ROOT, cli) {
       searchUrlRaw: setSearchParam(basePlan.searchUrlRaw, "gender", normalizedGender),
       exportNameSuffix: buildExportNameSuffix({ gender: normalizedGender }),
       gender: normalizedGender,
+      years: "",
     };
     }),
     mergedSearchId: searchIdFromBaseUrl(baseMergedUrl),
@@ -1450,6 +1476,8 @@ async function main() {
   }
 
   let loggedIn = false;
+  const searchProfileThreshold = 2500;
+  const searchYearsList = parseSearchYearsListEnv();
 
   const runSearchPlan = async (plan) => {
     const searchBaseUrl = normalizeSearchBaseUrl(plan.searchUrlRaw);
@@ -1484,12 +1512,35 @@ async function main() {
     const profileCount = await extractProfileCount(page);
     if (profileCount) {
       console.log(
-        `[contactout-bot] Profile count${plan.gender ? ` for gender=${plan.gender}` : ""}: ${profileCount.total} (${profileCount.summary})`
+        `[contactout-bot] Profile count${plan.gender ? ` for gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}: ${profileCount.total} (${profileCount.summary})`
       );
     } else {
       console.log(
-        `[contactout-bot] Profile count${plan.gender ? ` for gender=${plan.gender}` : ""}: not found on page`
+        `[contactout-bot] Profile count${plan.gender ? ` for gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}: not found on page`
       );
+    }
+
+    if (
+      profileCount &&
+      profileCount.total > searchProfileThreshold &&
+      !plan.years &&
+      searchYearsList.length > 0
+    ) {
+      console.log(
+        `[contactout-bot] gender=${plan.gender} has ${profileCount.total} profiles (> ${searchProfileThreshold}); splitting by years: ${searchYearsList.join(", ")}`
+      );
+      for (const years of searchYearsList) {
+        await runSearchPlan({
+          ...plan,
+          searchUrlRaw: setSearchParam(searchBaseUrl, "years", years),
+          exportNameSuffix: buildExportNameSuffix({
+            gender: plan.gender,
+            years,
+          }),
+          years: String(years).trim(),
+        });
+      }
+      return;
     }
 
     const gotoSearchPage = async (pageNum) => {
