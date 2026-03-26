@@ -695,6 +695,20 @@ async function inspectSearchPageState(page) {
   });
 }
 
+async function extractProfileCount(page) {
+  return page.evaluate(() => {
+    const text = String(document.body?.innerText || "");
+    const normalized = text.replace(/\s+/g, " ").trim();
+    const match = normalized.match(
+      /\b\d+\s*-\s*\d+\s+of\s+([\d,]+)\s+profiles?\b/i
+    );
+    if (!match) return null;
+    const total = parseInt(match[1].replace(/,/g, ""), 10);
+    if (!Number.isFinite(total)) return null;
+    return { total, summary: match[0] };
+  });
+}
+
 /**
  * Reads `MAX_PAGES` from `.env`: number of result pages to export (each gets its own `page=` in the URL).
  * Default 10. `0` = keep increasing `page` until a scrape returns no rows.
@@ -1465,6 +1479,17 @@ async function main() {
     if (!urlHasLocationParam(searchBaseUrl)) {
       await setLocationUnitedStates(page, plan.location);
       if (rotator) await persistSession();
+    }
+
+    const profileCount = await extractProfileCount(page);
+    if (profileCount) {
+      console.log(
+        `[contactout-bot] Profile count${plan.gender ? ` for gender=${plan.gender}` : ""}: ${profileCount.total} (${profileCount.summary})`
+      );
+    } else {
+      console.log(
+        `[contactout-bot] Profile count${plan.gender ? ` for gender=${plan.gender}` : ""}: not found on page`
+      );
     }
 
     const gotoSearchPage = async (pageNum) => {

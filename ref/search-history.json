@@ -45,6 +45,30 @@
         20
       ],
       "lastUpdated": "2026-03-25T15:31:10.185Z"
+    },
+    "92247a172c3d195dc7dbafdf": {
+      "canonicalBaseUrl": "https://contactout.com/dashboard/search?gender=male&location=United%20States&login=success&title=Director%20of%20Strategy",
+      "pagesCompleted": [
+        1,
+        2
+      ],
+      "lastUpdated": "2026-03-26T11:54:23.782Z"
+    },
+    "5953ace2414865a76e1590d3": {
+      "canonicalBaseUrl": "https://contactout.com/dashboard/search?gender=female&location=United%20States&login=success&title=Director%20of%20Strategy",
+      "pagesCompleted": [
+        1,
+        2
+      ],
+      "lastUpdated": "2026-03-26T11:56:06.271Z"
+    },
+    "e544019c22997fd61e412d2a": {
+      "canonicalBaseUrl": "https://contactout.com/dashboard/search?gender=unknown&location=United%20States&login=success&title=Director%20of%20Strategy",
+      "pagesCompleted": [
+        1,
+        2
+      ],
+      "lastUpdated": "2026-03-26T11:57:29.231Z"
     }
   }
 }
