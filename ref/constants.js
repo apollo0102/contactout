@@ -13,7 +13,7 @@
 // CONTACTOUT_PASSWORD=Glo123456!
 const SEARCH_KEYWORD = "United States"
 // SEARCH_TITLE="Director of Strategy"
-const SEARCH_TITLE = "Engineer"
+const SEARCH_TITLE = "Director of Strategy"
 //First priority in search
 const SEARCH_GENDER_LIST = ["Male", "Female", "Unknown"]
 
