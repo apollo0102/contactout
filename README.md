@@ -39,7 +39,7 @@ npm run export -- --random-search --random-seed=42
 
 See **`SEARCH_RANDOM`**, **`SEARCH_RANDOM_SEED`**, and **`SEARCH_PROFILE`** in the table below. **`CONTACTOUT_SEARCH_URL`** in `.env` overrides presets and random picks when set.
 
-By default the browser window is visible. Set `HEADLESS=1` to run headless. **Per-page** JSON files go under `exports/`; the **merged** JSON goes under `data/`. Exported filenames include sanitized `SEARCH_KEYWORD`, `SEARCH_TITLE`, and `SEARCH_GENDER` values when present; when you use **`SEARCH_GENDER_LIST`**, the final merged file is labeled with `all-genders`.
+By default the browser window is visible. Set `HEADLESS=1` to run headless. **Per-page** JSON files go under `exports/`; the **merged** JSON goes under `data/`. Exported filenames include sanitized `SEARCH_KEYWORD`, `SEARCH_ROLE`, and `SEARCH_GENDER` values when present; when you use **`SEARCH_GENDER_LIST`**, the final merged file is labeled with `all-genders`.
 
 ## Environment variables
 
@@ -56,7 +56,8 @@ By default the browser window is visible. Set `HEADLESS=1` to run headless. **Pe
 | `SEARCH_RANDOM` | No | Set `1` / `true`: pick one random value per key from **`search_params.pools`** and merge **`default_extra`** (e.g. `login=success`). Disabled if you use **`--search-profile=`** on the CLI |
 | `SEARCH_RANDOM_SEED` | No | Optional integer so **`SEARCH_RANDOM`** picks are reproducible; same as **`--random-seed=`** |
 | `SEARCH_KEYWORD` | No | Fallback label/location string if `CONTACTOUT_LOCATION` is unset (legacy alias) |
-| `SEARCH_TITLE` | No | Optional title filter added to generated search URLs; also included in exported JSON filenames when set |
+| `SEARCH_ROLE` | No | Optional role/title filter added to generated search URLs; also included in exported JSON filenames and output folder names when set |
+| `SEARCH_TITLE` | No | Legacy alias for `SEARCH_ROLE` |
 | `SEARCH_GENDER` | No | Optional gender filter added to generated search URLs; also included in exported JSON filenames when set. If empty, it is omitted from the filename |
 | `SEARCH_GENDER_LIST` | No | JSON array, bracket list, or comma/newline list of genders. The bot runs one search per gender, keeps separate page files, and merges all rows into one final JSON |
 | `SEARCH_YEARS` | No | JSON array, bracket list, or comma/newline list of `years` values. If a gender search count is over `2500`, the bot drills into each `years` item for that gender and merges the results |

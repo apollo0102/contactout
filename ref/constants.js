@@ -12,14 +12,14 @@
 
 // CONTACTOUT_PASSWORD=Glo123456!
 const SEARCH_KEYWORD = "United States"
-// SEARCH_TITLE="Director of Strategy"
-const SEARCH_TITLE = "Director of Strategy"
+// SEARCH_ROLE="Director of Strategy"
+const SEARCH_ROLE = "Director of Strategy"
 //First priority in search
 const SEARCH_GENDER_LIST = ["Male", "Female", "Unknown"]
 
 //Second priority in search
 // Years in current role // 0: 0-2 years, 1: 2-4 years, 2: 4-6 years, 3: 6-8 years 4: 8- 10 years 5: 10+years
-const SEARCH_YEARS = [0,1,2,3,4,5]
+const SEARCH_YEARS = [0, 1, 2, 3, 4, 5]
 
 //Third priority in search
 //Total years of experience // 0_1: less than 1 year, 1_2: 1-2 years, 3_5: 3-5 years, 6_10: 6-10 years, 10_9999: more than 10 years
@@ -204,10 +204,13 @@ const PROXY_ROTATE_EVERY = 5
 const EMPTY_PAGE_RETRY_MAX = 3
 const PROXY_429_SLEEP_AFTER_SWAP_MS = 3000
 // START_PAGE=10
+const PROXY_HEALTH_CHECK = 0;
+const PROXY_HEALTH_CHECK_URL = "https://contactout.com/";
+const PROXY_HEALTH_TIMEOUT_MS = 25000;
 
 export default {
     SEARCH_KEYWORD,
-    SEARCH_TITLE,
+    SEARCH_ROLE,
     SEARCH_GENDER_LIST,
     SEARCH_YEARS,
     SEARCH_TOTALYEARS,
@@ -219,4 +222,7 @@ export default {
     PROXY_ROTATE_EVERY,
     EMPTY_PAGE_RETRY_MAX,
     PROXY_429_SLEEP_AFTER_SWAP_MS,
+    PROXY_HEALTH_CHECK,
+    PROXY_HEALTH_CHECK_URL,
+    PROXY_HEALTH_TIMEOUT_MS,
 };

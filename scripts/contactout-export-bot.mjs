@@ -29,7 +29,8 @@
  *   SEARCH_KEYWORDS_PATH — optional JSON (default ./data/search_keywords.json). With SEARCH_PROFILE,
  *     selects presets / saved_searches, or use SEARCH_RANDOM (see below)
  *   SEARCH_PROFILE — id in search_params.presets[] or saved_searches[] (when CONTACTOUT_SEARCH_URL unset)
- *   SEARCH_TITLE — optional title filter added to generated search URLs
+ *   SEARCH_ROLE — optional role/title filter added to generated search URLs
+ *   SEARCH_TITLE — legacy alias for SEARCH_ROLE
  *   SEARCH_GENDER — optional gender filter added to generated search URLs
  *   SEARCH_GENDER_LIST — optional JSON / bracket list / comma/newline list of genders;
  *     runs one search per gender and merges all rows into one final JSON
@@ -110,7 +111,29 @@ async function loadConstantsConfigToEnv() {
 }
 
 function buildJson(rows) {
-  return JSON.stringify(rows, null, 2) + "\n";
+  return JSON.stringify(rows.map(mapExportRow), null, 2) + "\n";
+}
+
+function getSearchRoleValue() {
+  return String(process.env.SEARCH_ROLE || process.env.SEARCH_TITLE || "").trim();
+}
+
+function mapExportRow(row) {
+  const fullName = String(row?.fullName || "").trim();
+  const linkedin = String(row?.linkedinUrl || "").trim();
+  const workEmailDomain = String(row?.workEmailDomain || "").trim();
+  const website = workEmailDomain
+    ? /^https?:\/\//i.test(workEmailDomain)
+      ? workEmailDomain
+      : `https://${workEmailDomain}`
+    : "";
+  const role = getSearchRoleValue();
+  return {
+    full_name: fullName,
+    linkedin,
+    website,
+    role,
+  };
 }
 
 function sanitizeFilenamePart(value) {
@@ -275,7 +298,7 @@ function buildExportNameSuffix(options = {}) {
     process.env.SEARCH_KEYWORD?.trim() ||
     process.env.CONTACTOUT_LOCATION?.trim() ||
     "";
-  const title = process.env.SEARCH_TITLE?.trim() || "";
+  const title = getSearchRoleValue();
   const gender =
     options.gender !== undefined
       ? normalizeGenderValue(options.gender || "")
@@ -321,7 +344,7 @@ function buildExportFolderParts(options = {}) {
     process.env.SEARCH_KEYWORD?.trim() ||
     process.env.CONTACTOUT_LOCATION?.trim() ||
     "";
-  const title = process.env.SEARCH_TITLE?.trim() || "";
+  const title = getSearchRoleValue();
   const gender =
     options.gender !== undefined
       ? normalizeGenderValue(options.gender || "")
@@ -1104,7 +1127,7 @@ function resolveSearchUrlAndLocation(ROOT, cli) {
   const envLocation =
     process.env.CONTACTOUT_LOCATION?.trim() ||
     process.env.SEARCH_KEYWORD?.trim();
-  const envTitle = process.env.SEARCH_TITLE?.trim();
+  const envTitle = getSearchRoleValue();
   const envGender = normalizeGenderValue(process.env.SEARCH_GENDER?.trim());
   const defaultLocation = envLocation || "United States";
   const envFlatParams = {
@@ -1432,7 +1455,10 @@ async function main() {
     process.env.SEARCH_HISTORY_PATH || path.join(ROOT, "ref", "search-history.json")
   );
   const historyDir = path.dirname(historyPath);
-  const mergedDir = path.join(ROOT, "data");
+  const mergedRoleFolder = sanitizeFilenamePart(getSearchRoleValue());
+  const mergedDir = mergedRoleFolder
+    ? path.join(ROOT, "data", mergedRoleFolder)
+    : path.join(ROOT, "data");
   fs.mkdirSync(historyDir, { recursive: true });
   fs.mkdirSync(mergedDir, { recursive: true });
 

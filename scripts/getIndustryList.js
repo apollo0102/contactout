@@ -44,7 +44,7 @@ function buildSearchUrl(constants) {
   const base = new URL("https://contactout.com/dashboard/search");
   const location =
     String(constants.CONTACTOUT_LOCATION || constants.SEARCH_KEYWORD || "United States").trim();
-  const title = String(constants.SEARCH_TITLE || "").trim();
+  const title = String(constants.SEARCH_ROLE || constants.SEARCH_TITLE || "").trim();
   const genderList = Array.isArray(constants.SEARCH_GENDER_LIST)
     ? constants.SEARCH_GENDER_LIST
     : [];
