@@ -198,7 +198,7 @@ const SEARCH_INDUSTRY = [
 ]
 
 
-const MAX_PAGES = 2
+const MAX_PAGES = 100
 const PROXIES_FILE = "./ref/proxies.txt"
 const PROXY_ROTATE_EVERY = 5
 const EMPTY_PAGE_RETRY_MAX = 3
