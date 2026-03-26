@@ -1,0 +1,13 @@
+{
+  "name": "contactout-export-bot",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "export": "node scripts/contactout-export-bot.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "playwright": "^1.49.0",
+    "proxy-chain": "^2.4.0"
+  }
+}

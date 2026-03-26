@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "ContactOut search export",
+  "version": "1.0.0",
+  "description": "Export full name and LinkedIn profile URL from ContactOut search results on the current tab.",
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": [
+    "https://contactout.com/*",
+    "https://*.contactout.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Export ContactOut results"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://contactout.com/*",
+        "https://*.contactout.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

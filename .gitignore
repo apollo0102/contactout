@@ -1,0 +1,8 @@
+.DS_Store
+*.crx
+*.pem
+.env
+node_modules/
+playwright-user-data/
+exports/
+data/
