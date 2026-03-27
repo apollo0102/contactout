@@ -110,15 +110,17 @@ async function loadConstantsConfigToEnv() {
   }
 }
 
-function buildJson(rows) {
-  return JSON.stringify(rows.map(mapExportRow), null, 2) + "\n";
+function buildJson(rows, options = {}) {
+  return JSON.stringify(rows.map((row) => mapExportRow(row, options)), null, 2) + "\n";
 }
 
-function getSearchRoleValue() {
-  return String(process.env.SEARCH_ROLE || process.env.SEARCH_TITLE || "").trim();
+function getSearchRoleValue(override = "") {
+  return String(
+    override || process.env.SEARCH_ROLE || process.env.SEARCH_TITLE || ""
+  ).trim();
 }
 
-function mapExportRow(row) {
+function mapExportRow(row, options = {}) {
   const business = String(row?.business || "").trim();
   const fullName = String(row?.fullName || "").trim();
   const linkedin = String(row?.linkedinUrl || "").trim();
@@ -130,7 +132,9 @@ function mapExportRow(row) {
       ? workEmailDomain
       : `https://${workEmailDomain}`
     : "";
-  const role = String(row?.role || getSearchRoleValue()).trim();
+  const role = String(
+    row?.role || options.searchRole || getSearchRoleValue()
+  ).trim();
   return {
     business,
     full_name: fullName,
@@ -170,6 +174,27 @@ function parseSearchGenderListEnv() {
       raw
         .split(/[\n,]+/)
         .map((s) => String(s).trim().replace(/^['"]|['"]$/g, ""))
+        .filter(Boolean)
+    ),
+  ];
+}
+
+function parseSearchRoleListEnv() {
+  const raw = process.env.SEARCH_ROLE_LIST?.trim();
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return [...new Set(parsed.map((s) => String(s).trim()).filter(Boolean))];
+    }
+  } catch {
+    /* fall through */
+  }
+  return [
+    ...new Set(
+      raw
+        .split(/[\n,]+/)
+        .map((s) => s.trim())
         .filter(Boolean)
     ),
   ];
@@ -307,7 +332,7 @@ function buildExportNameSuffix(options = {}) {
     process.env.SEARCH_KEYWORD?.trim() ||
     process.env.CONTACTOUT_LOCATION?.trim() ||
     "";
-  const title = getSearchRoleValue();
+  const title = getSearchRoleValue(options.role);
   const gender =
     options.gender !== undefined
       ? normalizeGenderValue(options.gender || "")
@@ -353,7 +378,7 @@ function buildExportFolderParts(options = {}) {
     process.env.SEARCH_KEYWORD?.trim() ||
     process.env.CONTACTOUT_LOCATION?.trim() ||
     "";
-  const title = getSearchRoleValue();
+  const title = getSearchRoleValue(options.role);
   const gender =
     options.gender !== undefined
       ? normalizeGenderValue(options.gender || "")
@@ -892,6 +917,14 @@ function setSearchParam(searchUrl, key, value) {
   return u.toString();
 }
 
+function applySearchUrlOverrides(searchUrl, flatParams = {}) {
+  let nextUrl = searchUrl;
+  for (const [key, value] of Object.entries(flatParams)) {
+    nextUrl = setSearchParam(nextUrl, key, value);
+  }
+  return nextUrl;
+}
+
 /**
  * First `page=` query value (default 1). Use e.g. 4 to resume at
  * ...&page=4
@@ -907,12 +940,12 @@ function parseStartPageEnv() {
 /**
  * Runs the bundled IIFE in the page context (same row shape as the extension popup export).
  */
-async function scrapeCurrentPageRows(page) {
+async function scrapeCurrentPageRows(page, roleHint = "") {
   const code = scrapeDomEvalSource;
   return page.evaluate(({ src, roleHint }) => {
     window.__CONTACTOUT_ROLE_HINT = roleHint || "";
     return (0, eval)(src);
-  }, { src: code, roleHint: getSearchRoleValue() });
+  }, { src: code, roleHint: getSearchRoleValue(roleHint) });
 }
 
 async function inspectSearchPageState(page) {
@@ -1132,12 +1165,12 @@ function pickRandomParamsFromPools(pools, rng) {
  * When CONTACTOUT_SEARCH_URL is not set, apply SEARCH_PROFILE / SEARCH_RANDOM / pools in search_keywords.json.
  * @returns {{ location: string, searchUrlRaw: string }}
  */
-function resolveSearchUrlAndLocation(ROOT, cli) {
+function resolveSearchUrlAndLocation(ROOT, cli, roleOverride = "") {
   const envUrl = process.env.CONTACTOUT_SEARCH_URL?.trim();
   const envLocation =
     process.env.CONTACTOUT_LOCATION?.trim() ||
     process.env.SEARCH_KEYWORD?.trim();
-  const envTitle = getSearchRoleValue();
+  const envTitle = getSearchRoleValue(roleOverride);
   const envGender = normalizeGenderValue(process.env.SEARCH_GENDER?.trim());
   const defaultLocation = envLocation || "United States";
   const envFlatParams = {
@@ -1147,9 +1180,10 @@ function resolveSearchUrlAndLocation(ROOT, cli) {
   };
 
   if (envUrl) {
+    const searchUrlRaw = applySearchUrlOverrides(envUrl, envFlatParams);
     return {
-      location: locationFromSearchUrl(envUrl) || defaultLocation,
-      searchUrlRaw: envUrl,
+      location: locationFromSearchUrl(searchUrlRaw) || defaultLocation,
+      searchUrlRaw,
     };
   }
 
@@ -1222,12 +1256,13 @@ function resolveSearchUrlAndLocation(ROOT, cli) {
           ? preset.contactout_search_url.trim()
           : "";
       if (urlRaw) {
+        const searchUrlRaw = applySearchUrlOverrides(urlRaw, envFlatParams);
         return {
           location:
             (typeof preset.location === "string" && preset.location.trim()) ||
-            locationFromSearchUrl(urlRaw) ||
+            locationFromSearchUrl(searchUrlRaw) ||
             defaultLocation,
-          searchUrlRaw: urlRaw,
+          searchUrlRaw,
         };
       }
       const merged = {
@@ -1257,12 +1292,13 @@ function resolveSearchUrlAndLocation(ROOT, cli) {
           ? entry.contactout_search_url.trim()
           : "";
       if (urlRaw) {
+        const searchUrlRaw = applySearchUrlOverrides(urlRaw, envFlatParams);
         return {
           location:
             (typeof entry.location === "string" && entry.location.trim()) ||
-            locationFromSearchUrl(urlRaw) ||
+            locationFromSearchUrl(searchUrlRaw) ||
             defaultLocation,
-          searchUrlRaw: urlRaw,
+          searchUrlRaw,
         };
       }
       if (typeof entry.location === "string" && entry.location.trim()) {
@@ -1298,56 +1334,66 @@ function resolveSearchUrlAndLocation(ROOT, cli) {
 }
 
 function buildSearchPlans(ROOT, cli) {
-  const basePlan = resolveSearchUrlAndLocation(ROOT, cli);
   const genderList = parseSearchGenderListEnv();
-  if (genderList.length <= 1) {
-    const gender = normalizeGenderValue(
-      genderList[0] || process.env.SEARCH_GENDER?.trim() || ""
+  const roleList = parseSearchRoleListEnv();
+  const roles = roleList.length ? roleList : [getSearchRoleValue()].filter(Boolean);
+  const effectiveRoles = roles.length ? roles : [""];
+  const normalizedGenders = genderList.length
+    ? [...new Set(genderList.map((gender) => normalizeGenderValue(gender)))]
+    : [normalizeGenderValue(process.env.SEARCH_GENDER?.trim() || "")];
+  const effectiveGenders = normalizedGenders.length ? normalizedGenders : [""];
+  const multiGender = effectiveGenders.length > 1;
+  const plans = [];
+  const mergePlans = [];
+
+  for (const role of effectiveRoles) {
+    const basePlan = resolveSearchUrlAndLocation(ROOT, cli, role);
+    const mergedBaseUrl = normalizeSearchBaseUrl(
+      setSearchParam(basePlan.searchUrlRaw, "gender", "")
     );
-    const searchUrlRaw = gender
-      ? setSearchParam(basePlan.searchUrlRaw, "gender", gender)
-      : basePlan.searchUrlRaw;
-    return {
-      plans: [
-        {
-          location: basePlan.location,
-          searchUrlRaw,
-          exportNameSuffix: buildExportNameSuffix({ gender }),
-          gender,
-          years: "",
-          totalYears: "",
-          employeeSize: "",
-          revenueMin: "",
-          revenueMax: "",
-          industry: "",
-        },
-      ],
-      mergedSearchId: searchIdFromBaseUrl(normalizeSearchBaseUrl(searchUrlRaw)),
-      mergedExportNameSuffix: buildExportNameSuffix({ gender }),
-    };
+    const mergeKey = role || "__default__";
+    const roleFolder = sanitizeFilenamePart(role);
+    mergePlans.push({
+      mergeKey,
+      role,
+      mergedSearchId: searchIdFromBaseUrl(mergedBaseUrl),
+      mergedExportNameSuffix: buildExportNameSuffix({
+        role,
+        gender: multiGender ? "all-genders" : effectiveGenders[0],
+      }),
+      mergedDir: roleFolder
+        ? path.join(ROOT, "data", roleFolder)
+        : path.join(ROOT, "data"),
+    });
+
+    for (const gender of effectiveGenders) {
+      const normalizedGender = normalizeGenderValue(gender);
+      const searchUrlRaw = normalizedGender
+        ? setSearchParam(basePlan.searchUrlRaw, "gender", normalizedGender)
+        : setSearchParam(basePlan.searchUrlRaw, "gender", "");
+      plans.push({
+        location: basePlan.location,
+        role,
+        mergeKey,
+        searchUrlRaw,
+        exportNameSuffix: buildExportNameSuffix({
+          role,
+          gender: normalizedGender,
+        }),
+        gender: normalizedGender,
+        years: "",
+        totalYears: "",
+        employeeSize: "",
+        revenueMin: "",
+        revenueMax: "",
+        industry: "",
+      });
+    }
   }
 
-  const baseMergedUrl = normalizeSearchBaseUrl(
-    setSearchParam(basePlan.searchUrlRaw, "gender", "")
-  );
   return {
-    plans: genderList.map((gender) => {
-      const normalizedGender = normalizeGenderValue(gender);
-      return {
-      location: basePlan.location,
-      searchUrlRaw: setSearchParam(basePlan.searchUrlRaw, "gender", normalizedGender),
-      exportNameSuffix: buildExportNameSuffix({ gender: normalizedGender }),
-      gender: normalizedGender,
-      years: "",
-      totalYears: "",
-      employeeSize: "",
-      revenueMin: "",
-      revenueMax: "",
-      industry: "",
-    };
-    }),
-    mergedSearchId: searchIdFromBaseUrl(baseMergedUrl),
-    mergedExportNameSuffix: buildExportNameSuffix({ gender: "all-genders" }),
+    plans,
+    mergePlans,
   };
 }
 
@@ -1455,8 +1501,7 @@ async function main() {
   );
   fs.mkdirSync(exportDir, { recursive: true });
 
-  const { plans: searchPlans, mergedSearchId, mergedExportNameSuffix } =
-    buildSearchPlans(ROOT, cli);
+  const { plans: searchPlans, mergePlans } = buildSearchPlans(ROOT, cli);
   const startPage = parseStartPageEnv();
   const maxPages = parseMaxPagesEnv();
   const unlimitedPages = maxPages === 0;
@@ -1465,12 +1510,10 @@ async function main() {
     process.env.SEARCH_HISTORY_PATH || path.join(ROOT, "ref", "search-history.json")
   );
   const historyDir = path.dirname(historyPath);
-  const mergedRoleFolder = sanitizeFilenamePart(getSearchRoleValue());
-  const mergedDir = mergedRoleFolder
-    ? path.join(ROOT, "data", mergedRoleFolder)
-    : path.join(ROOT, "data");
   fs.mkdirSync(historyDir, { recursive: true });
-  fs.mkdirSync(mergedDir, { recursive: true });
+  for (const mergePlan of mergePlans) {
+    fs.mkdirSync(mergePlan.mergedDir, { recursive: true });
+  }
 
   const ignoreSearchHistory =
     process.env.IGNORE_SEARCH_HISTORY === "1" ||
@@ -1493,7 +1536,9 @@ async function main() {
   }
 
   let history = loadSearchHistory(historyPath);
-  const rowsForMerge = [];
+  const rowsForMergeByKey = new Map(
+    mergePlans.map((mergePlan) => [mergePlan.mergeKey, []])
+  );
 
   const rotator = createProxyRotator();
   const storageStatePath = path.join(userDataDir, "storage-state.json");
@@ -1721,6 +1766,7 @@ async function main() {
     const searchId = searchIdFromBaseUrl(searchBaseUrl);
     const exportNameSuffix = plan.exportNameSuffix;
     const exportFolderParts = buildExportFolderParts({
+      role: plan.role,
       gender: plan.gender,
       years: plan.years,
       totalYears: plan.totalYears,
@@ -1731,11 +1777,11 @@ async function main() {
     });
     const firstUrl = buildSearchUrlWithPage(searchBaseUrl, startPage);
     console.log(
-      `[contactout-bot] Starting search${plan.gender ? ` (gender=${plan.gender})` : ""}: ${searchBaseUrl}`
+      `[contactout-bot] Starting search${plan.role ? ` (role=${plan.role})` : ""}${plan.gender ? ` (gender=${plan.gender})` : ""}: ${searchBaseUrl}`
     );
     await gotoWith429Retry(
       firstUrl,
-      `first search page${plan.gender ? ` gender=${plan.gender}` : ""}`
+      `first search page${plan.role ? ` role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}`
     );
 
     if (pathnameLooksLikeLogin(page.url())) {
@@ -1757,12 +1803,12 @@ async function main() {
 
     const profileCount = await extractProfileCount(page);
     if (profileCount) {
-      console.log(
-        `[contactout-bot] Profile count${plan.gender ? ` for gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}${plan.revenueMin || plan.revenueMax ? ` revenue=${plan.revenueMin || "min"}-${plan.revenueMax || "plus"}` : ""}${plan.industry ? ` industry=${plan.industry}` : ""}: ${profileCount.total} (${profileCount.summary})`
+        console.log(
+        `[contactout-bot] Profile count${plan.role ? ` for role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}${plan.revenueMin || plan.revenueMax ? ` revenue=${plan.revenueMin || "min"}-${plan.revenueMax || "plus"}` : ""}${plan.industry ? ` industry=${plan.industry}` : ""}: ${profileCount.total} (${profileCount.summary})`
       );
     } else {
       console.log(
-        `[contactout-bot] Profile count${plan.gender ? ` for gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}${plan.revenueMin || plan.revenueMax ? ` revenue=${plan.revenueMin || "min"}-${plan.revenueMax || "plus"}` : ""}${plan.industry ? ` industry=${plan.industry}` : ""}: not found on page`
+        `[contactout-bot] Profile count${plan.role ? ` for role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}${plan.revenueMin || plan.revenueMax ? ` revenue=${plan.revenueMin || "min"}-${plan.revenueMax || "plus"}` : ""}${plan.industry ? ` industry=${plan.industry}` : ""}: not found on page`
       );
     }
 
@@ -1780,6 +1826,7 @@ async function main() {
           ...plan,
           searchUrlRaw: setSearchParam(searchBaseUrl, "years", years),
           exportNameSuffix: buildExportNameSuffix({
+            role: plan.role,
             gender: plan.gender,
             years,
           }),
@@ -1808,6 +1855,7 @@ async function main() {
           ...plan,
           searchUrlRaw: setSearchParam(searchBaseUrl, "employee_size", employeeSize),
           exportNameSuffix: buildExportNameSuffix({
+            role: plan.role,
             gender: plan.gender,
             years: plan.years,
             totalYears: plan.totalYears,
@@ -1834,6 +1882,7 @@ async function main() {
           ...plan,
           searchUrlRaw: setSearchParam(searchBaseUrl, "totalYears", totalYears),
           exportNameSuffix: buildExportNameSuffix({
+            role: plan.role,
             gender: plan.gender,
             years: plan.years,
             totalYears,
@@ -1867,6 +1916,7 @@ async function main() {
           ...plan,
           searchUrlRaw: nextUrl,
           exportNameSuffix: buildExportNameSuffix({
+            role: plan.role,
             gender: plan.gender,
             years: plan.years,
             totalYears: plan.totalYears,
@@ -1902,6 +1952,7 @@ async function main() {
           ...plan,
           searchUrlRaw: setSearchParam(searchBaseUrl, "industry", industry),
           exportNameSuffix: buildExportNameSuffix({
+            role: plan.role,
             gender: plan.gender,
             years: plan.years,
             totalYears: plan.totalYears,
@@ -1932,7 +1983,7 @@ async function main() {
     let lastPaginationFingerprint = "";
 
     const exportPageToJson = (pageNum, urlThis, rows) => {
-      const json = buildJson(rows);
+      const json = buildJson(rows, { searchRole: plan.role });
       const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
       const outDir = path.join(exportDir, ...exportFolderParts);
       fs.mkdirSync(outDir, { recursive: true });
@@ -1959,7 +2010,7 @@ async function main() {
         await gotoSearchPage(pageNum);
         await sleep(2_000);
 
-        const rows = await scrapeCurrentPageRows(page);
+        const rows = await scrapeCurrentPageRows(page, plan.role);
         if (rows.length === 0) {
           const pageState = await inspectSearchPageState(page);
           const looksLikeLogin =
@@ -2001,7 +2052,11 @@ async function main() {
         lastPaginationFingerprint = fp;
 
         exportPageToJson(pageNum, urlThis, rows);
-        rowsForMerge.push(...rows);
+        if (rows.length > 0) {
+          const bucket = rowsForMergeByKey.get(plan.mergeKey) || [];
+          bucket.push(...rows);
+          rowsForMergeByKey.set(plan.mergeKey, bucket);
+        }
         if (!ignoreSearchHistory) {
           markPageCompleted(history, searchId, searchBaseUrl, pageNum);
           saveSearchHistory(historyPath, history);
@@ -2051,7 +2106,7 @@ async function main() {
         if (res.duplicate) break;
       }
       console.log(
-        `[contactout-bot] Finished page range (MAX_PAGES=${maxPages})${plan.gender ? ` for gender=${plan.gender}` : ""}.`
+        `[contactout-bot] Finished page range (MAX_PAGES=${maxPages})${plan.role ? ` for role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}.`
       );
     }
   };
@@ -2061,21 +2116,32 @@ async function main() {
       await runSearchPlan(plan);
     }
 
-    if (mergeJson && rowsForMerge.length > 0) {
-      const merged = dedupeRowsByLinkedin(rowsForMerge);
-      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
-      const mergedPath = path.join(
-        mergedDir,
-        `contactout-merged-${mergedSearchId.slice(0, 8)}${mergedExportNameSuffix}-items-${merged.length}-${stamp}.json`
-      );
-      fs.writeFileSync(mergedPath, buildJson(merged), "utf8");
-      console.log(
-        `[contactout-bot] Merged ${rowsForMerge.length} row(s) from this run в†’ ${merged.length} unique в†’ ${mergedPath}`
-      );
-    } else if (mergeJson) {
-      console.log(
-        "[contactout-bot] No new rows this run; merged JSON not written."
-      );
+    if (mergeJson) {
+      let wroteMergedOutput = false;
+      for (const mergePlan of mergePlans) {
+        const rowsForMerge = rowsForMergeByKey.get(mergePlan.mergeKey) || [];
+        if (rowsForMerge.length === 0) continue;
+        const merged = dedupeRowsByLinkedin(rowsForMerge);
+        const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+        const mergedPath = path.join(
+          mergePlan.mergedDir,
+          `contactout-merged-${mergePlan.mergedSearchId.slice(0, 8)}${mergePlan.mergedExportNameSuffix}-items-${merged.length}-${stamp}.json`
+        );
+        fs.writeFileSync(
+          mergedPath,
+          buildJson(merged, { searchRole: mergePlan.role }),
+          "utf8"
+        );
+        console.log(
+          `[contactout-bot] Merged ${rowsForMerge.length} row(s) for ${mergePlan.role || "default role"} -> ${merged.length} unique -> ${mergedPath}`
+        );
+        wroteMergedOutput = true;
+      }
+      if (!wroteMergedOutput) {
+        console.log(
+          "[contactout-bot] No new rows this run; merged JSON not written."
+        );
+      }
     }
     return;
 
