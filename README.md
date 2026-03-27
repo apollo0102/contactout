@@ -39,7 +39,7 @@ npm run export -- --random-search --random-seed=42
 
 See **`SEARCH_RANDOM`**, **`SEARCH_RANDOM_SEED`**, and **`SEARCH_PROFILE`** in the table below. **`CONTACTOUT_SEARCH_URL`** in `.env` overrides presets and random picks when set.
 
-By default the browser window is visible. Set `HEADLESS=1` to run headless. **Per-page** JSON files go under `exports/`; the **merged** JSON goes under `data/`. Exported filenames include sanitized `SEARCH_KEYWORD`, `SEARCH_ROLE`, and `SEARCH_GENDER` values when present; when you use **`SEARCH_GENDER_LIST`**, the final merged file is labeled with `all-genders`.
+By default the browser window is visible. Set `HEADLESS=1` to run headless. **Per-page** JSON files go under `exports/`; the **merged** JSON goes under `data/`. Exported filenames include sanitized `SEARCH_COUNTRY_LIST`, `SEARCH_ROLE_LIST`, and `SEARCH_GENDER` values when present; when you use **`SEARCH_GENDER_LIST`**, the final merged file is labeled with `all-genders`.
 
 ## Environment variables
 
@@ -49,15 +49,14 @@ By default the browser window is visible. Set `HEADLESS=1` to run headless. **Pe
 | `EMAIL_USER1`, `EMAIL_USER2`, … | When login needed | Multiple accounts in order; **same password** as `CONTACTOUT_PASSWORD` for all. On **HTTP 429**, the bot switches to the **next** email and clears session before signing in again |
 | `EMAIL_USERS` | When login needed | Comma- or newline-separated list (instead of numbered `EMAIL_USER*` vars) |
 | `CONTACTOUT_PASSWORD` | When login needed | Password shared by all accounts in the pool |
-| `CONTACTOUT_LOCATION` | No | Location filter text (default: `United States`). If unset, `SEARCH_KEYWORD` is used when present. Used to build the default search URL as `?location=…` |
+| `CONTACTOUT_LOCATION` | No | Optional explicit location override used to build the default search URL as `?location=…` |
 | `CONTACTOUT_SEARCH_URL` | No | Full dashboard search URL. Any `page=` is removed; the bot sets `page`. If set, overrides **`SEARCH_PROFILE`** and **`SEARCH_RANDOM`** |
 | `SEARCH_KEYWORDS_PATH` | No | Path to **`data/search_keywords.json`** (default: that path). Contains **`search_params`** (`pools`, `presets`, `default_extra`) plus legacy **`saved_searches`** |
 | `SEARCH_PROFILE` | No | When **`CONTACTOUT_SEARCH_URL`** unset: **`search_params.presets[].id`** first (params merged into a URL), else **`saved_searches[].id`**. Ignored for random if you pass **`--search-profile=`** on the CLI (that preset wins) |
 | `SEARCH_RANDOM` | No | Set `1` / `true`: pick one random value per key from **`search_params.pools`** and merge **`default_extra`** (e.g. `login=success`). Disabled if you use **`--search-profile=`** on the CLI |
 | `SEARCH_RANDOM_SEED` | No | Optional integer so **`SEARCH_RANDOM`** picks are reproducible; same as **`--random-seed=`** |
-| `SEARCH_KEYWORD` | No | Fallback label/location string if `CONTACTOUT_LOCATION` is unset (legacy alias) |
-| `SEARCH_ROLE` | No | Optional role/title filter added to generated search URLs; also included in exported JSON filenames and output folder names when set |
-| `SEARCH_TITLE` | No | Legacy alias for `SEARCH_ROLE` |
+| `SEARCH_COUNTRY_LIST` | No | JSON array, bracket list, or comma/newline list of countries/locations. The bot runs one search per country and keeps outputs in separate country folders |
+| `SEARCH_ROLE_LIST` | No | JSON array, bracket list, or comma/newline list of role titles. The bot runs one search per role and keeps outputs in separate role folders |
 | `SEARCH_GENDER` | No | Optional gender filter added to generated search URLs; also included in exported JSON filenames when set. If empty, it is omitted from the filename |
 | `SEARCH_GENDER_LIST` | No | JSON array, bracket list, or comma/newline list of genders. The bot runs one search per gender, keeps separate page files, and merges all rows into one final JSON |
 | `SEARCH_YEARS` | No | JSON array, bracket list, or comma/newline list of `years` values. If a gender search count is over `2500`, the bot drills into each `years` item for that gender and merges the results |
@@ -72,7 +71,7 @@ By default the browser window is visible. Set `HEADLESS=1` to run headless. **Pe
 | `IGNORE_SEARCH_HISTORY` | No | Set `1` or `true` to ignore history and re-download every page |
 | `MERGE_JSON` | No | Set `0` or `false` to skip writing the combined `contactout-merged-*.json` at the end of a run |
 | `MERGE_CSV` | No | Legacy alias for `MERGE_JSON` |
-| `STOP_ON_DUPLICATE_PAGE` | No | Default **on**: if page **N** returns the **same people** as page **N−1** (ContactOut often caps pagination and repeats the last page), the bot **stops without writing** that duplicate and tells you to change **`SEARCH_KEYWORD`**, **`CONTACTOUT_LOCATION`**, **`SEARCH_PROFILE`**, or **`CONTACTOUT_SEARCH_URL`**. Set `0` / `false` to disable |
+| `STOP_ON_DUPLICATE_PAGE` | No | Default **on**: if page **N** returns the **same people** as page **N−1** (ContactOut often caps pagination and repeats the last page), the bot **stops without writing** that duplicate and tells you to change **`SEARCH_COUNTRY_LIST`**, **`CONTACTOUT_LOCATION`**, **`SEARCH_PROFILE`**, or **`CONTACTOUT_SEARCH_URL`**. Set `0` / `false` to disable |
 | `HEADLESS` | No | Set to `1` or `true` to run Chromium headless |
 | `PROXIES` | No | **JSON array**, bracket list, or one URL per line. If **`PROXIES_FILE`** is set too, both are **merged** (deduped) |
 | `PROXIES_FILE` | No | Large list file, e.g. **`./ref/proxies.txt`** for [Proxifly](https://proxifly.dev)-style **`http://ip:port`** lines. Path is relative to the **project root** |

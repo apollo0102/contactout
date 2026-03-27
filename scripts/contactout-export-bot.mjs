@@ -14,7 +14,8 @@
  *   EMAIL_USERS — fallback comma/newline list alternative to numbered vars
  *   On HTTP 429 with multiple emails, the bot advances to the next email and clears
  *     session (cookies + storage-state when using proxies) before re-login.
- *   CONTACTOUT_LOCATION — default "United States"
+ *   SEARCH_COUNTRY_LIST — country/location filters for generated searches
+ *   CONTACTOUT_LOCATION — optional explicit location override
  *   CONTACTOUT_SEARCH_URL — optional base URL (location, etc.); `page` is set by the bot
  *   START_PAGE — first `page=` in the URL (default 1)
  *   MAX_PAGES — how many pages to export (default 10). `0` = keep incrementing `page` until a scrape returns 0 rows
@@ -24,13 +25,12 @@
  *   MERGE_JSON — set "0" to skip writing one combined JSON file at the end of a run
  *   MERGE_CSV — legacy alias for MERGE_JSON
  *   STOP_ON_DUPLICATE_PAGE — if not "0"/"false", stop when page N matches page N−1
- *     (ContactOut often repeats the last page forever). Then change SEARCH_KEYWORD /
+ *     (ContactOut often repeats the last page forever). Then change SEARCH_COUNTRY_LIST /
  *     CONTACTOUT_LOCATI ON / CONTACTOUT_SEARCH_URL and re-run (default: on)
  *   SEARCH_KEYWORDS_PATH — optional JSON (default ./data/search_keywords.json). With SEARCH_PROFILE,
  *     selects presets / saved_searches, or use SEARCH_RANDOM (see below)
  *   SEARCH_PROFILE — id in search_params.presets[] or saved_searches[] (when CONTACTOUT_SEARCH_URL unset)
- *   SEARCH_ROLE — optional role/title filter added to generated search URLs
- *   SEARCH_TITLE — legacy alias for SEARCH_ROLE
+ *   SEARCH_ROLE_LIST — optional role/title filters added to generated search URLs
  *   SEARCH_GENDER — optional gender filter added to generated search URLs
  *   SEARCH_GENDER_LIST — optional JSON / bracket list / comma/newline list of genders;
  *     runs one search per gender and merges all rows into one final JSON
@@ -115,8 +115,17 @@ function buildJson(rows, options = {}) {
 }
 
 function getSearchRoleValue(override = "") {
+  const roleList = parseSearchRoleListEnv();
+  return String(override || roleList[0] || "").trim();
+}
+
+function getSearchCountryValue(override = "") {
+  const countryList = parseSearchCountryListEnv();
   return String(
-    override || process.env.SEARCH_ROLE || process.env.SEARCH_TITLE || ""
+    override ||
+      countryList[0] ||
+      process.env.CONTACTOUT_LOCATION ||
+      ""
   ).trim();
 }
 
@@ -181,6 +190,27 @@ function parseSearchGenderListEnv() {
 
 function parseSearchRoleListEnv() {
   const raw = process.env.SEARCH_ROLE_LIST?.trim();
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return [...new Set(parsed.map((s) => String(s).trim()).filter(Boolean))];
+    }
+  } catch {
+    /* fall through */
+  }
+  return [
+    ...new Set(
+      raw
+        .split(/[\n,]+/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+    ),
+  ];
+}
+
+function parseSearchCountryListEnv() {
+  const raw = process.env.SEARCH_COUNTRY_LIST?.trim();
   if (!raw) return [];
   try {
     const parsed = JSON.parse(raw);
@@ -328,10 +358,7 @@ function normalizeGenderValue(value) {
 }
 
 function buildExportNameSuffix(options = {}) {
-  const keyword =
-    process.env.SEARCH_KEYWORD?.trim() ||
-    process.env.CONTACTOUT_LOCATION?.trim() ||
-    "";
+  const keyword = getSearchCountryValue(options.country);
   const title = getSearchRoleValue(options.role);
   const gender =
     options.gender !== undefined
@@ -374,10 +401,7 @@ function buildExportNameSuffix(options = {}) {
 }
 
 function buildExportFolderParts(options = {}) {
-  const keyword =
-    process.env.SEARCH_KEYWORD?.trim() ||
-    process.env.CONTACTOUT_LOCATION?.trim() ||
-    "";
+  const keyword = getSearchCountryValue(options.country);
   const title = getSearchRoleValue(options.role);
   const gender =
     options.gender !== undefined
@@ -1165,11 +1189,9 @@ function pickRandomParamsFromPools(pools, rng) {
  * When CONTACTOUT_SEARCH_URL is not set, apply SEARCH_PROFILE / SEARCH_RANDOM / pools in search_keywords.json.
  * @returns {{ location: string, searchUrlRaw: string }}
  */
-function resolveSearchUrlAndLocation(ROOT, cli, roleOverride = "") {
+function resolveSearchUrlAndLocation(ROOT, cli, roleOverride = "", countryOverride = "") {
   const envUrl = process.env.CONTACTOUT_SEARCH_URL?.trim();
-  const envLocation =
-    process.env.CONTACTOUT_LOCATION?.trim() ||
-    process.env.SEARCH_KEYWORD?.trim();
+  const envLocation = getSearchCountryValue(countryOverride);
   const envTitle = getSearchRoleValue(roleOverride);
   const envGender = normalizeGenderValue(process.env.SEARCH_GENDER?.trim());
   const defaultLocation = envLocation || "United States";
@@ -1334,8 +1356,11 @@ function resolveSearchUrlAndLocation(ROOT, cli, roleOverride = "") {
 }
 
 function buildSearchPlans(ROOT, cli) {
+  const countryList = parseSearchCountryListEnv();
   const genderList = parseSearchGenderListEnv();
   const roleList = parseSearchRoleListEnv();
+  const countries = countryList.length ? countryList : [getSearchCountryValue()].filter(Boolean);
+  const effectiveCountries = countries.length ? countries : ["United States"];
   const roles = roleList.length ? roleList : [getSearchRoleValue()].filter(Boolean);
   const effectiveRoles = roles.length ? roles : [""];
   const normalizedGenders = genderList.length
@@ -1346,48 +1371,55 @@ function buildSearchPlans(ROOT, cli) {
   const plans = [];
   const mergePlans = [];
 
-  for (const role of effectiveRoles) {
-    const basePlan = resolveSearchUrlAndLocation(ROOT, cli, role);
-    const mergedBaseUrl = normalizeSearchBaseUrl(
-      setSearchParam(basePlan.searchUrlRaw, "gender", "")
-    );
-    const mergeKey = role || "__default__";
-    const roleFolder = sanitizeFilenamePart(role);
-    mergePlans.push({
-      mergeKey,
-      role,
-      mergedSearchId: searchIdFromBaseUrl(mergedBaseUrl),
-      mergedExportNameSuffix: buildExportNameSuffix({
-        role,
-        gender: multiGender ? "all-genders" : effectiveGenders[0],
-      }),
-      mergedDir: roleFolder
-        ? path.join(ROOT, "data", roleFolder)
-        : path.join(ROOT, "data"),
-    });
-
-    for (const gender of effectiveGenders) {
-      const normalizedGender = normalizeGenderValue(gender);
-      const searchUrlRaw = normalizedGender
-        ? setSearchParam(basePlan.searchUrlRaw, "gender", normalizedGender)
-        : setSearchParam(basePlan.searchUrlRaw, "gender", "");
-      plans.push({
-        location: basePlan.location,
-        role,
+  for (const country of effectiveCountries) {
+    for (const role of effectiveRoles) {
+      const basePlan = resolveSearchUrlAndLocation(ROOT, cli, role, country);
+      const mergedBaseUrl = normalizeSearchBaseUrl(
+        setSearchParam(basePlan.searchUrlRaw, "gender", "")
+      );
+      const mergeKey = `${country || "__default-country__"}::${role || "__default-role__"}`;
+      const mergedFolderParts = [
+        sanitizeFilenamePart(country),
+        sanitizeFilenamePart(role),
+      ].filter(Boolean);
+      mergePlans.push({
         mergeKey,
-        searchUrlRaw,
-        exportNameSuffix: buildExportNameSuffix({
+        country,
+        role,
+        mergedSearchId: searchIdFromBaseUrl(mergedBaseUrl),
+        mergedExportNameSuffix: buildExportNameSuffix({
+          country,
           role,
-          gender: normalizedGender,
+          gender: multiGender ? "all-genders" : effectiveGenders[0],
         }),
-        gender: normalizedGender,
-        years: "",
-        totalYears: "",
-        employeeSize: "",
-        revenueMin: "",
-        revenueMax: "",
-        industry: "",
+        mergedDir: path.join(ROOT, "data", ...mergedFolderParts),
       });
+
+      for (const gender of effectiveGenders) {
+        const normalizedGender = normalizeGenderValue(gender);
+        const searchUrlRaw = normalizedGender
+          ? setSearchParam(basePlan.searchUrlRaw, "gender", normalizedGender)
+          : setSearchParam(basePlan.searchUrlRaw, "gender", "");
+        plans.push({
+          location: basePlan.location,
+          country,
+          role,
+          mergeKey,
+          searchUrlRaw,
+          exportNameSuffix: buildExportNameSuffix({
+            country,
+            role,
+            gender: normalizedGender,
+          }),
+          gender: normalizedGender,
+          years: "",
+          totalYears: "",
+          employeeSize: "",
+          revenueMin: "",
+          revenueMax: "",
+          industry: "",
+        });
+      }
     }
   }
 
@@ -1766,6 +1798,7 @@ async function main() {
     const searchId = searchIdFromBaseUrl(searchBaseUrl);
     const exportNameSuffix = plan.exportNameSuffix;
     const exportFolderParts = buildExportFolderParts({
+      country: plan.country,
       role: plan.role,
       gender: plan.gender,
       years: plan.years,
@@ -1826,6 +1859,7 @@ async function main() {
           ...plan,
           searchUrlRaw: setSearchParam(searchBaseUrl, "years", years),
           exportNameSuffix: buildExportNameSuffix({
+            country: plan.country,
             role: plan.role,
             gender: plan.gender,
             years,
@@ -1855,6 +1889,7 @@ async function main() {
           ...plan,
           searchUrlRaw: setSearchParam(searchBaseUrl, "employee_size", employeeSize),
           exportNameSuffix: buildExportNameSuffix({
+            country: plan.country,
             role: plan.role,
             gender: plan.gender,
             years: plan.years,
@@ -1882,6 +1917,7 @@ async function main() {
           ...plan,
           searchUrlRaw: setSearchParam(searchBaseUrl, "totalYears", totalYears),
           exportNameSuffix: buildExportNameSuffix({
+            country: plan.country,
             role: plan.role,
             gender: plan.gender,
             years: plan.years,
@@ -1916,6 +1952,7 @@ async function main() {
           ...plan,
           searchUrlRaw: nextUrl,
           exportNameSuffix: buildExportNameSuffix({
+            country: plan.country,
             role: plan.role,
             gender: plan.gender,
             years: plan.years,
@@ -1952,6 +1989,7 @@ async function main() {
           ...plan,
           searchUrlRaw: setSearchParam(searchBaseUrl, "industry", industry),
           exportNameSuffix: buildExportNameSuffix({
+            country: plan.country,
             role: plan.role,
             gender: plan.gender,
             years: plan.years,
@@ -2045,7 +2083,7 @@ async function main() {
         ) {
           console.warn(
             `[contactout-bot] Page ${pageNum} is identical to the previous page (pagination stuck). ` +
-              `Not writing JSON. Update SEARCH_KEYWORD, CONTACTOUT_LOCATION, SEARCH_PROFILE / --random-search (search_keywords.json), or CONTACTOUT_SEARCH_URL / filters for a new slice of results, then re-run (or set STOP_ON_DUPLICATE_PAGE=0 to ignore).`
+              `Not writing JSON. Update SEARCH_COUNTRY_LIST, CONTACTOUT_LOCATION, SEARCH_PROFILE / --random-search (search_keywords.json), or CONTACTOUT_SEARCH_URL / filters for a new slice of results, then re-run (or set STOP_ON_DUPLICATE_PAGE=0 to ignore).`
           );
           return { duplicate: true, rows };
         }
@@ -2239,7 +2277,7 @@ async function main() {
         ) {
           console.warn(
             `[contactout-bot] Page ${pageNum} is identical to the previous page (pagination stuck). ` +
-              `Not writing JSON. Update SEARCH_KEYWORD, CONTACTOUT_LOCATION, SEARCH_PROFILE / --random-search (search_keywords.json), or CONTACTOUT_SEARCH_URL / filters for a new slice of results, then re-run (or set STOP_ON_DUPLICATE_PAGE=0 to ignore).`
+              `Not writing JSON. Update SEARCH_COUNTRY_LIST, CONTACTOUT_LOCATION, SEARCH_PROFILE / --random-search (search_keywords.json), or CONTACTOUT_SEARCH_URL / filters for a new slice of results, then re-run (or set STOP_ON_DUPLICATE_PAGE=0 to ignore).`
           );
           return { duplicate: true, rows };
         }

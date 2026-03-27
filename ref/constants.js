@@ -11,9 +11,8 @@
 // CONTACTOUT_PASSWORD=Sharkham617@
 
 // CONTACTOUT_PASSWORD=Glo123456!
-const SEARCH_KEYWORD = "United States"
-// SEARCH_ROLE="Director of Strategy"
-const SEARCH_ROLE = "Director of Strategy"
+const SEARCH_COUNTRY_LIST = ["United Kingdom", "Dubai, United Arab Emirates", "Dubai, Dubai, United Arab Emirates"]
+
 const SEARCH_ROLE_LIST = ["Director of Strategy", "Head of Engineering"]
 
 //First priority in search
@@ -211,8 +210,7 @@ const PROXY_HEALTH_CHECK_URL = "https://contactout.com/";
 const PROXY_HEALTH_TIMEOUT_MS = 25000;
 
 export default {
-    SEARCH_KEYWORD,
-    SEARCH_ROLE,
+    SEARCH_COUNTRY_LIST,
     SEARCH_ROLE_LIST,
     SEARCH_GENDER_LIST,
     SEARCH_YEARS,

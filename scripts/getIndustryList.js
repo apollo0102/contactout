@@ -42,9 +42,19 @@ async function loadAccounts() {
 
 function buildSearchUrl(constants) {
   const base = new URL("https://contactout.com/dashboard/search");
+  const countryList = Array.isArray(constants.SEARCH_COUNTRY_LIST)
+    ? constants.SEARCH_COUNTRY_LIST.map((value) => String(value || "").trim()).filter(Boolean)
+    : [];
   const location =
-    String(constants.CONTACTOUT_LOCATION || constants.SEARCH_KEYWORD || "United States").trim();
-  const title = String(constants.SEARCH_ROLE || constants.SEARCH_TITLE || "").trim();
+    String(
+      constants.CONTACTOUT_LOCATION ||
+        countryList[0] ||
+        "United States"
+    ).trim();
+  const roleList = Array.isArray(constants.SEARCH_ROLE_LIST)
+    ? constants.SEARCH_ROLE_LIST.map((value) => String(value || "").trim()).filter(Boolean)
+    : [];
+  const title = String(roleList[0] || "").trim();
   const genderList = Array.isArray(constants.SEARCH_GENDER_LIST)
     ? constants.SEARCH_GENDER_LIST
     : [];
