@@ -130,7 +130,7 @@ function mapExportRow(row) {
       ? workEmailDomain
       : `https://${workEmailDomain}`
     : "";
-  const role = getSearchRoleValue();
+  const role = String(row?.role || getSearchRoleValue()).trim();
   return {
     business,
     full_name: fullName,

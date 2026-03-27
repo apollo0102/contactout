@@ -682,6 +682,51 @@
     return "";
   }
 
+  function detailedRoleFromRoleLine(line, fullName) {
+    const text = cleanTextValue(line);
+    if (!text || !/\bat\b/i.test(text)) return "";
+    if (!lineMatchesRoleHint(text) && !looksLikeEmploymentLine(text)) return "";
+    const m = text.match(
+      /^(.*?)(?=\s+at\s+.+?(?:\s+(?:in|since)\s+\d{4}\b|\s+\(?\d{4}\)?\s*[-–]\s*(?:present|\d{4})\b|\s+[|•·]\s+|$))/i
+    );
+    const candidate = cleanTextValue(m?.[1] || "").replace(/\s+[|•·]\s+.*$/i, "");
+    if (!candidate) return "";
+    if (looksLikeEducationLine(candidate)) return "";
+    return candidate;
+  }
+
+  function detailedRoleFromRow(row, anchor, fullName) {
+    if (!row || !anchor) return "";
+
+    const fromHeaderNextLine = employmentLineAfterHeaderFromScopes(
+      row,
+      anchor,
+      fullName
+    );
+    if (fromHeaderNextLine) {
+      const parsed = detailedRoleFromRoleLine(fromHeaderNextLine, fullName);
+      if (parsed) return parsed;
+    }
+
+    const fromGeometryLine = employmentLineByGeometryFromScopes(
+      row,
+      anchor,
+      fullName
+    );
+    if (fromGeometryLine) {
+      const parsed = detailedRoleFromRoleLine(fromGeometryLine, fullName);
+      if (parsed) return parsed;
+    }
+
+    const lines = employmentLinesFromProfileScopes(row, anchor, fullName);
+    for (const line of lines) {
+      const parsed = detailedRoleFromRoleLine(line, fullName);
+      if (parsed) return parsed;
+    }
+
+    return roleHintText();
+  }
+
   function debugValueCount(obj) {
     if (!obj || typeof obj !== "object") return 0;
     let count = 0;
@@ -1417,7 +1462,7 @@
   }
 
   function scrapeResults() {
-    /** @type {Map<string, { fullName: string, linkedinUrl: string, workEmailDomain: string, business: string, location: string, facebookUrl: string, debug?: object }>} */
+    /** @type {Map<string, { fullName: string, linkedinUrl: string, workEmailDomain: string, business: string, role: string, location: string, facebookUrl: string, debug?: object }>} */
     const map = new Map();
     const anchors = document.querySelectorAll('a[href*="linkedin.com/in/"]');
 
@@ -1430,6 +1475,7 @@
       const fullName = guessNameFromAnchor(a);
       const workEmailDomain = workEmailDomainFromRow(row, a);
       const business = businessFromRow(row, a, fullName);
+      const detailedRole = detailedRoleFromRow(row, a, fullName);
       const location = locationFromRow(row, a, fullName);
       const facebookUrl = facebookUrlFromRow(row, a);
       const debug = debugProfileSnapshot(row, a, fullName);
@@ -1445,6 +1491,10 @@
         prev?.business || "",
         name || fullName
       );
+      const roleName =
+        detailedRole && detailedRole.length > (prev?.role || "").length
+          ? detailedRole
+          : prev?.role || roleHintText() || "";
       const profileLocation =
         location && location.length > (prev?.location || "").length
           ? location
@@ -1455,6 +1505,7 @@
         linkedinUrl,
         workEmailDomain: domain,
         business: businessName,
+        role: roleName,
         location: profileLocation,
         facebookUrl: facebook,
         debug: preferredDebugSnapshot(debug, prev?.debug),
