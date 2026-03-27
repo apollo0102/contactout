@@ -279,6 +279,395 @@
     return scored[0].d;
   }
 
+  function elementIsVisible(el) {
+    if (!el) return false;
+    const st = window.getComputedStyle(el);
+    if (st.display === "none" || st.visibility === "hidden") return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 2 && r.height > 2;
+  }
+
+  function cleanTextValue(s) {
+    return String(s || "").replace(/\s+/g, " ").trim();
+  }
+
+  function roleHintText() {
+    return cleanTextValue(window.__CONTACTOUT_ROLE_HINT || "");
+  }
+
+  function lineMatchesRoleHint(text) {
+    const roleHint = roleHintText();
+    if (!roleHint) return false;
+    return normKey(cleanTextValue(text)).includes(normKey(roleHint));
+  }
+
+  function looksLikeDomainOrUrl(s) {
+    const t = cleanTextValue(s);
+    if (!t) return false;
+    if (/^https?:\/\//i.test(t)) return true;
+    if (/^[a-z0-9.-]+\.[a-z]{2,}(?:\/|$)/i.test(t)) return true;
+    return false;
+  }
+
+  function nearestAcceptedText(root, selector, anchor, accept) {
+    if (!root) return "";
+    const ar = anchor?.getBoundingClientRect?.() || null;
+    let best = "";
+    let bestDist = Infinity;
+    for (const el of root.querySelectorAll(selector)) {
+      if (!elementIsVisible(el)) continue;
+      const text = cleanTextValue(el.textContent || el.getAttribute?.("aria-label") || "");
+      if (!text) continue;
+      if (accept && !accept(text, el)) continue;
+      const er = el.getBoundingClientRect();
+      const dist = ar
+        ? Math.abs(er.top - ar.top) + Math.abs(er.left - ar.left) * 0.12
+        : er.top;
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = text;
+      }
+    }
+    return best;
+  }
+
+  function nearestAcceptedTextFromScopes(row, selector, anchor, accept) {
+    let scope = row;
+    for (let hop = 0; hop < 10 && scope; hop++) {
+      const found = nearestAcceptedText(scope, selector, anchor, accept);
+      if (found) return found;
+      scope = scope.parentElement;
+    }
+    return "";
+  }
+
+  function visibleUniqueLines(root) {
+    const lines = (root?.innerText || "")
+      .split("\n")
+      .map((line) => cleanTextValue(line))
+      .filter(Boolean);
+    const out = [];
+    const seen = new Set();
+    for (const line of lines) {
+      const key = line.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(line);
+    }
+    return out;
+  }
+
+  function visibleUniqueLinesFromScopes(row) {
+    const out = [];
+    const seen = new Set();
+    let scope = row;
+    for (let hop = 0; hop < 8 && scope; hop++) {
+      for (const line of visibleUniqueLines(scope)) {
+        const key = line.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(line);
+      }
+      scope = scope.parentElement;
+    }
+    return out;
+  }
+
+  function employmentLineTextsFromScopes(row) {
+    const out = [];
+    const seen = new Set();
+    let scope = row;
+    for (let hop = 0; hop < 8 && scope; hop++) {
+      for (const el of scope.querySelectorAll("div, span, p, li, a, strong, b")) {
+        if (!elementIsVisible(el)) continue;
+        const candidates = [el, el.parentElement, el.parentElement?.parentElement];
+        for (const candidateEl of candidates) {
+          if (!candidateEl) continue;
+          const text = cleanTextValue(candidateEl.textContent || "");
+          if (!text || text.length > 220) continue;
+          if (!lineMatchesRoleHint(text) && !looksLikeEmploymentLine(text)) continue;
+          const key = text.toLowerCase();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push(text);
+        }
+      }
+      scope = scope.parentElement;
+    }
+    return out;
+  }
+
+  function looksLikeLocationText(s) {
+    const t = cleanTextValue(s);
+    if (!t || t.length > 120) return false;
+    if (looksLikePersonName(t)) return false;
+    if (looksLikeDomainOrUrl(t) || t.includes("@")) return false;
+    if (NAME_BLOCKLIST.has(normKey(t))) return false;
+    if (/^\d[\d\s.,-]*$/.test(t)) return false;
+    const parts = t.split(",").map((part) => part.trim()).filter(Boolean);
+    if (parts.length >= 2 && parts.length <= 5) return true;
+    return /\b(united states|canada|united kingdom|uk|australia|india|germany|france|ireland|singapore|netherlands|new zealand)\b/i.test(
+      t
+    );
+  }
+
+  function looksLikeRoleText(s) {
+    const t = cleanTextValue(s);
+    if (!t || t.length > 120) return false;
+    if (looksLikeDomainOrUrl(t) || t.includes("@")) return false;
+    return /\b(director|manager|specialist|engineer|analyst|consultant|founder|owner|president|vice president|vp|head|lead|recruiter|officer|coordinator|developer|designer|architect|administrator|assistant|associate|executive|partner|principal|supervisor|strategist|human resources)\b/i.test(
+      t
+    );
+  }
+
+  function looksLikeEducationLine(s) {
+    const t = cleanTextValue(s);
+    return /\b(bachelor|master|mba|phd|doctorate|university|college|school|student|alumni|degree|graduat)\b/i.test(
+      t
+    );
+  }
+
+  function looksLikeEmploymentLine(s) {
+    const t = cleanTextValue(s);
+    if (!t || !/\bat\b/i.test(t)) return false;
+    if (looksLikeEducationLine(t)) return false;
+    const beforeAt = cleanTextValue(t.split(/\bat\b/i)[0] || "");
+    if (looksLikeRoleText(beforeAt)) return true;
+    if (
+      /\b(founder|co-?founder|chief|creative|growth|marketing|sales|operations|product|design|engineering|business development|social media|finance|strategy|strategic|people|talent|partnerships)\b/i.test(
+        beforeAt
+      )
+    ) {
+      return true;
+    }
+    return /\bin\s+\d{4}\s*[-–]\s*(present|\d{4})\b/i.test(t);
+  }
+
+  function looksLikeBusinessText(s, fullName) {
+    const t = cleanTextValue(s);
+    if (!t || t.length > 120) return false;
+    if (fullName && normKey(t) === normKey(fullName)) return false;
+    if (looksLikePersonName(t)) return false;
+    if (looksLikeLocationText(t)) return false;
+    if (looksLikeDomainOrUrl(t) || t.includes("@")) return false;
+    if (NAME_BLOCKLIST.has(normKey(t))) return false;
+    if (looksLikeRoleText(t)) return false;
+    return true;
+  }
+
+  function businessFromRoleLine(line, fullName) {
+    const text = cleanTextValue(line);
+    if (!text || !/\bat\b/i.test(text)) return "";
+    if (!lineMatchesRoleHint(text) && !looksLikeEmploymentLine(text)) return "";
+    const m = text.match(/\bat\s+(.+)$/i);
+    if (!m || !m[1]) return "";
+    const candidate = cleanTextValue(m[1])
+      .replace(/\s+in\s+\d{4}.*$/i, "")
+      .replace(/\s+since\s+\d{4}.*$/i, "")
+      .replace(/\s+\(?\d{4}\)?\s*[-–].*$/i, "")
+      .replace(/\s+[|•·]\s+.*$/i, "")
+      .trim();
+    return looksLikeBusinessText(candidate, fullName) ? candidate : "";
+  }
+
+  function businessAnchorFromEmploymentLine(row, fullName) {
+    let scope = row;
+    for (let hop = 0; hop < 8 && scope; hop++) {
+      for (const link of scope.querySelectorAll("a")) {
+        if (!elementIsVisible(link)) continue;
+        const href = String(link.getAttribute("href") || "").trim();
+        const text = cleanTextValue(link.textContent || "");
+        if (!text || !looksLikeBusinessText(text, fullName)) continue;
+        if (/linkedin\.com\/in\//i.test(href)) continue;
+        if (/facebook\.com|twitter\.com|x\.com|instagram\.com/i.test(href)) continue;
+        const parentText = cleanTextValue(link.parentElement?.textContent || "");
+        const grandText = cleanTextValue(link.parentElement?.parentElement?.textContent || "");
+        if (
+          lineMatchesRoleHint(parentText) ||
+          looksLikeEmploymentLine(parentText) ||
+          lineMatchesRoleHint(grandText) ||
+          looksLikeEmploymentLine(grandText)
+        ) {
+          return text;
+        }
+      }
+      scope = scope.parentElement;
+    }
+    return "";
+  }
+
+  function locationFromHeaderElements(row, anchor, fullName) {
+    if (!row || !anchor) return "";
+    const ar = anchor.getBoundingClientRect();
+    let scope = row;
+    for (let hop = 0; hop < 10 && scope; hop++) {
+      let best = "";
+      let bestDist = Infinity;
+      for (const el of scope.querySelectorAll("div, span, p, a, strong, small")) {
+        if (!elementIsVisible(el)) continue;
+        const er = el.getBoundingClientRect();
+        if (Math.abs(er.top - ar.top) > 18) continue;
+        if (er.left + er.width < ar.left) continue;
+        let text = cleanTextValue(el.textContent || "");
+        if (!text) continue;
+        if (fullName && normKey(text).startsWith(normKey(fullName))) {
+          text = cleanTextValue(text.slice(fullName.length)).replace(
+            /^[|/,\-•·\s]+/,
+            ""
+          );
+        }
+        if (!looksLikeLocationText(text)) continue;
+        const dist = Math.abs(er.left - ar.left) + Math.abs(er.top - ar.top) * 0.2;
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = text;
+        }
+      }
+      if (best) return best;
+      scope = scope.parentElement;
+    }
+    return "";
+  }
+
+  function businessFromRow(row, anchor, fullName) {
+    if (!row || !anchor) return "";
+
+    const directBusinessAnchor = businessAnchorFromEmploymentLine(row, fullName);
+    if (directBusinessAnchor) return directBusinessAnchor;
+
+    const lines = employmentLineTextsFromScopes(row);
+    for (const line of lines) {
+      if (!lineMatchesRoleHint(line)) continue;
+      const parsed = businessFromRoleLine(line, fullName);
+      if (parsed) return parsed;
+    }
+
+    const roleLineText = nearestAcceptedTextFromScopes(
+      row,
+      "div, span, p, li, a, strong",
+      anchor,
+      (text) =>
+        Boolean(businessFromRoleLine(text, fullName)) &&
+        (!roleHintText() || lineMatchesRoleHint(text))
+    );
+    if (roleLineText) {
+      const parsed = businessFromRoleLine(roleLineText, fullName);
+      if (parsed) return parsed;
+    }
+
+    for (const line of lines) {
+      const parsed = businessFromRoleLine(line, fullName);
+      if (parsed) return parsed;
+    }
+
+    const fromCompanyAnchor = nearestAcceptedTextFromScopes(
+      row,
+      "a[href*='linkedin.com/company/'], a[href*='/company/']",
+      anchor,
+      (text, el) => {
+        if (!looksLikeBusinessText(text, fullName)) return false;
+        const parentText = cleanTextValue(el.parentElement?.textContent || "");
+        const grandText = cleanTextValue(el.parentElement?.parentElement?.textContent || "");
+        return (
+          lineMatchesRoleHint(parentText) ||
+          looksLikeEmploymentLine(parentText) ||
+          lineMatchesRoleHint(grandText) ||
+          looksLikeEmploymentLine(grandText)
+        );
+      }
+    );
+    if (fromCompanyAnchor) return fromCompanyAnchor;
+
+    const fromCompanyField = nearestAcceptedTextFromScopes(
+      row,
+      "[class*='company' i], [class*='business' i], [data-testid*='company' i], [data-field='company']",
+      anchor,
+      (text, el) => {
+        if (!looksLikeBusinessText(text, fullName)) return false;
+        const parentText = cleanTextValue(el.parentElement?.textContent || "");
+        const grandText = cleanTextValue(el.parentElement?.parentElement?.textContent || "");
+        return (
+          lineMatchesRoleHint(parentText) ||
+          looksLikeEmploymentLine(parentText) ||
+          lineMatchesRoleHint(grandText) ||
+          looksLikeEmploymentLine(grandText)
+        );
+      }
+    );
+    if (fromCompanyField) return fromCompanyField;
+
+    return "";
+  }
+
+  function locationFromRow(row, anchor, fullName) {
+    if (!row || !anchor) return "";
+
+    const fromHeaderElements = locationFromHeaderElements(row, anchor, fullName);
+    if (fromHeaderElements) return fromHeaderElements;
+
+    const lines = visibleUniqueLines(row);
+    if (fullName) {
+      const fullNameKey = normKey(fullName);
+      for (const line of lines) {
+        if (!normKey(line).startsWith(fullNameKey)) continue;
+        const suffix = cleanTextValue(line.slice(fullName.length)).replace(
+          /^[|/,\-•·\s]+/,
+          ""
+        );
+        if (looksLikeLocationText(suffix)) return suffix;
+      }
+    }
+
+    const fromLocationField = nearestAcceptedTextFromScopes(
+      row,
+      "[class*='location' i], [data-testid*='location' i], [data-field='location']",
+      anchor,
+      (text) => looksLikeLocationText(text)
+    );
+    if (fromLocationField) return fromLocationField;
+
+    for (const line of lines) {
+      if (fullName && normKey(line) === normKey(fullName)) continue;
+      if (looksLikeLocationText(line)) return line;
+    }
+    return "";
+  }
+
+  function normalizeFacebookUrl(href) {
+    try {
+      const u = new URL(href, window.location.href);
+      const host = u.hostname.toLowerCase().replace(/^m\./, "").replace(/^www\./, "");
+      if (host !== "facebook.com") return "";
+      if (/^\/(sharer|share|dialog|plugins)\b/i.test(u.pathname)) return "";
+      return `https://www.facebook.com${u.pathname}${u.search || ""}`;
+    } catch {
+      return "";
+    }
+  }
+
+  function facebookUrlFromRow(row, anchor) {
+    if (!row || !anchor) return "";
+    const ar = anchor.getBoundingClientRect();
+    const scored = [];
+    let scope = row;
+    for (let hop = 0; hop < 10 && scope; hop++) {
+      for (const link of scope.querySelectorAll("a[href*='facebook.com']")) {
+        if (!elementIsVisible(link)) continue;
+        const url = normalizeFacebookUrl(link.href);
+        if (!url) continue;
+        const lr = link.getBoundingClientRect();
+        const dist =
+          Math.abs(lr.top - ar.top) + Math.abs(lr.left - ar.left) * 0.12;
+        scored.push({ url, dist });
+      }
+      if (scored.length) break;
+      scope = scope.parentElement;
+    }
+    if (!scored.length) return "";
+    scored.sort((a, b) => a.dist - b.dist);
+    return scored[0].url;
+  }
+
   function resultRowForAnchor(a) {
     const hit = a.closest(
       "tr, li, article, [role='row'], [role='listitem'], [data-testid], [class*='card' i], [class*='result' i], [class*='profile' i], [class*='person' i], [class*='candidate' i], [class*='lead' i], [class*='row' i]"
@@ -359,7 +748,7 @@
   }
 
   function scrapeResults() {
-    /** @type {Map<string, { fullName: string, linkedinUrl: string, workEmailDomain: string }>} */
+    /** @type {Map<string, { fullName: string, linkedinUrl: string, workEmailDomain: string, business: string, location: string, facebookUrl: string }>} */
     const map = new Map();
     const anchors = document.querySelectorAll('a[href*="linkedin.com/in/"]');
 
@@ -371,6 +760,9 @@
       const row = resultRowForAnchor(a);
       const fullName = guessNameFromAnchor(a);
       const workEmailDomain = workEmailDomainFromRow(row, a);
+      const business = businessFromRow(row, a, fullName);
+      const location = locationFromRow(row, a, fullName);
+      const facebookUrl = facebookUrlFromRow(row, a);
 
       const prev = map.get(linkedinUrl);
       const name =
@@ -378,10 +770,22 @@
           ? fullName
           : prev.fullName;
       const domain = workEmailDomain || prev?.workEmailDomain || "";
+      const businessName =
+        business && business.length > (prev?.business || "").length
+          ? business
+          : prev?.business || "";
+      const profileLocation =
+        location && location.length > (prev?.location || "").length
+          ? location
+          : prev?.location || "";
+      const facebook = facebookUrl || prev?.facebookUrl || "";
       map.set(linkedinUrl, {
         fullName: name || "",
         linkedinUrl,
         workEmailDomain: domain,
+        business: businessName,
+        location: profileLocation,
+        facebookUrl: facebook,
       });
     }
 

@@ -119,9 +119,12 @@ function getSearchRoleValue() {
 }
 
 function mapExportRow(row) {
+  const business = String(row?.business || "").trim();
   const fullName = String(row?.fullName || "").trim();
   const linkedin = String(row?.linkedinUrl || "").trim();
+  const location = String(row?.location || "").trim();
   const workEmailDomain = String(row?.workEmailDomain || "").trim();
+  const facebook = String(row?.facebookUrl || "").trim();
   const website = workEmailDomain
     ? /^https?:\/\//i.test(workEmailDomain)
       ? workEmailDomain
@@ -129,10 +132,16 @@ function mapExportRow(row) {
     : "";
   const role = getSearchRoleValue();
   return {
+    business,
     full_name: fullName,
     linkedin,
+    location,
     website,
     role,
+    socials: {
+      linkedin,
+      ...(facebook ? { facebook } : {}),
+    },
   };
 }
 
@@ -900,9 +909,10 @@ function parseStartPageEnv() {
  */
 async function scrapeCurrentPageRows(page) {
   const code = scrapeDomEvalSource;
-  return page.evaluate((src) => {
+  return page.evaluate(({ src, roleHint }) => {
+    window.__CONTACTOUT_ROLE_HINT = roleHint || "";
     return (0, eval)(src);
-  }, code);
+  }, { src: code, roleHint: getSearchRoleValue() });
 }
 
 async function inspectSearchPageState(page) {
