@@ -998,14 +998,33 @@ async function inspectSearchPageState(page) {
 async function extractProfileCount(page) {
   return page.evaluate(() => {
     const text = String(document.body?.innerText || "");
-    const normalized = text.replace(/\s+/g, " ").trim();
-    const match = normalized.match(
-      /\b\d+\s*-\s*\d+\s+of\s+([\d,]+)\s+profiles?\b/i
-    );
-    if (!match) return null;
-    const total = parseInt(match[1].replace(/,/g, ""), 10);
-    if (!Number.isFinite(total)) return null;
-    return { total, summary: match[0] };
+    const lines = text
+      .split(/\r?\n/)
+      .map((line) => line.replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+    const normalized = lines.join(" ");
+    const patterns = [
+      /\b\d+\s*-\s*\d+\s+of\s+([\d,]+)\+?\s+(profiles?|results?|people)\b/i,
+      /\bshowing\s+\d+\s*-\s*\d+\s+of\s+([\d,]+)\+?\s+(profiles?|results?|people)\b/i,
+      /\bof\s+([\d,]+)\+?\s+(profiles?|results?|people)\b/i,
+      /\b([\d,]+)\+?\s+(profiles?|results?|people)\b/i,
+    ];
+    const candidates = [
+      ...lines.filter((line) => /\b(profiles?|results?|people)\b/i.test(line)),
+      normalized,
+    ];
+
+    for (const candidate of candidates) {
+      for (const pattern of patterns) {
+        const match = candidate.match(pattern);
+        if (!match) continue;
+        const total = parseInt(String(match[1] || "").replace(/,/g, ""), 10);
+        if (!Number.isFinite(total)) continue;
+        return { total, summary: match[0] };
+      }
+    }
+
+    return null;
   });
 }
 
@@ -1834,14 +1853,66 @@ async function main() {
       if (rotator) await persistSession();
     }
 
-    const profileCount = await extractProfileCount(page);
+    const reloadFirstSearchPage = async () => {
+      await gotoWith429Retry(
+        firstUrl,
+        `first search page retry${plan.role ? ` role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}`
+      );
+      if (pathnameLooksLikeLogin(page.url())) {
+        await login(page, currentEmail(), accountPassword);
+        await gotoWith429Retry(firstUrl, "after re-login first search page");
+        if (rotator) await persistSession();
+      }
+    };
+
+    const readProfileCountFromHealthyFirstPage = async () => {
+      for (let attempt = 0; attempt <= emptyPageRetryMax; attempt++) {
+        if (attempt > 0) {
+          await reloadFirstSearchPage();
+          await sleep(2_000);
+        }
+
+        const profileCount = await extractProfileCount(page);
+        if (profileCount) return profileCount;
+
+        const rows = await scrapeCurrentPageRows(page, plan.role);
+        const pageState = await inspectSearchPageState(page);
+        const looksLikeLogin =
+          pathnameLooksLikeLogin(page.url()) || pageState.hasPasswordInput;
+        const suspicious =
+          pageState.blocked || looksLikeLogin || (!pageState.noResults && rows.length === 0);
+
+        if (attempt < emptyPageRetryMax && (suspicious || rows.length > 0)) {
+          console.warn(
+            `[contactout-bot] Profile count not readable on first page; retry ${attempt + 1}/${emptyPageRetryMax}.`
+          );
+          if (rotator && suspicious) {
+            await recreateProxyContext(
+              pageState.blocked || looksLikeLogin
+                ? "blocked first search page"
+                : "incomplete first search page",
+              { clearSession: pageState.blocked || looksLikeLogin }
+            );
+          } else if (!rotator && suspicious) {
+            await sleep(backoff429);
+          }
+          continue;
+        }
+
+        return null;
+      }
+
+      return null;
+    };
+
+    const profileCount = await readProfileCountFromHealthyFirstPage();
     if (profileCount) {
-        console.log(
+      console.log(
         `[contactout-bot] Profile count${plan.role ? ` for role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}${plan.revenueMin || plan.revenueMax ? ` revenue=${plan.revenueMin || "min"}-${plan.revenueMax || "plus"}` : ""}${plan.industry ? ` industry=${plan.industry}` : ""}: ${profileCount.total} (${profileCount.summary})`
       );
     } else {
-      console.log(
-        `[contactout-bot] Profile count${plan.role ? ` for role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}${plan.revenueMin || plan.revenueMax ? ` revenue=${plan.revenueMin || "min"}-${plan.revenueMax || "plus"}` : ""}${plan.industry ? ` industry=${plan.industry}` : ""}: not found on page`
+      console.warn(
+        `[contactout-bot] Profile count${plan.role ? ` for role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}${plan.revenueMin || plan.revenueMax ? ` revenue=${plan.revenueMin || "min"}-${plan.revenueMax || "plus"}` : ""}${plan.industry ? ` industry=${plan.industry}` : ""}: not found after first-page retries; proceeding without priority split`
       );
     }
 
