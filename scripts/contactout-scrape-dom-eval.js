@@ -730,81 +730,6 @@
     return roleHintText();
   }
 
-  function debugValueCount(obj) {
-    if (!obj || typeof obj !== "object") return 0;
-    let count = 0;
-    for (const value of Object.values(obj)) {
-      if (Array.isArray(value)) {
-        count += value.filter(Boolean).length;
-      } else if (value) {
-        count += 1;
-      }
-    }
-    return count;
-  }
-
-  function preferredDebugSnapshot(nextDebug, prevDebug) {
-    const nextCount = debugValueCount(nextDebug);
-    const prevCount = debugValueCount(prevDebug);
-    return nextCount >= prevCount ? nextDebug : prevDebug;
-  }
-
-  function debugProfileSnapshot(row, anchor, fullName) {
-    const rowLines = visibleUniqueLines(row).slice(0, 8);
-    let matchedScopeLines = [];
-    let headerLine = "";
-    let secondLine = "";
-    let scope = row;
-    for (let hop = 0; hop < 8 && scope; hop++) {
-      if (!scopeMatchesProfile(scope, anchor, fullName)) {
-        scope = scope.parentElement;
-        continue;
-      }
-      const lines = visibleUniqueLines(scope);
-      const fullNameKey = normKey(fullName);
-      const headerIdx = fullNameKey
-        ? lines.findIndex(
-            (line, idx) => idx < 8 && normKey(line).includes(fullNameKey)
-          )
-        : -1;
-      if (headerIdx !== -1) {
-        matchedScopeLines = lines.slice(0, Math.min(lines.length, headerIdx + 6));
-        headerLine = lines[headerIdx] || "";
-        secondLine = lines[headerIdx + 1] || "";
-        break;
-      }
-      scope = scope.parentElement;
-    }
-
-    const headerEmploymentLine = employmentLineAfterHeaderFromScopes(
-      row,
-      anchor,
-      fullName
-    );
-    const geometryEmploymentLine = employmentLineByGeometryFromScopes(
-      row,
-      anchor,
-      fullName
-    );
-
-    return {
-      row_lines: rowLines,
-      scope_lines: matchedScopeLines,
-      header_line: headerLine,
-      second_line: secondLine,
-      employment_line_from_header: headerEmploymentLine,
-      employment_line_from_geometry: geometryEmploymentLine,
-      extracted_business_from_header: businessFromRoleLine(
-        headerEmploymentLine,
-        fullName
-      ),
-      extracted_business_from_geometry: businessFromRoleLine(
-        geometryEmploymentLine,
-        fullName
-      ),
-    };
-  }
-
   function looksLikeExtractedBusinessText(s, fullName) {
     const t = cleanTextValue(s);
     if (!t || t.length > 140) return false;
@@ -1465,7 +1390,7 @@
   }
 
   function scrapeResults() {
-    /** @type {Map<string, { fullName: string, linkedinUrl: string, workEmailDomain: string, business: string, role: string, location: string, facebookUrl: string, debug?: object }>} */
+    /** @type {Map<string, { fullName: string, linkedinUrl: string, workEmailDomain: string, business: string, role: string, location: string, facebookUrl: string }>} */
     const map = new Map();
     const anchors = document.querySelectorAll('a[href*="linkedin.com/in/"]');
 
@@ -1481,7 +1406,6 @@
       const detailedRole = detailedRoleFromRow(row, a, fullName);
       const location = locationFromRow(row, a, fullName);
       const facebookUrl = facebookUrlFromRow(row, a);
-      const debug = debugProfileSnapshot(row, a, fullName);
 
       const prev = map.get(linkedinUrl);
       const name =
@@ -1511,7 +1435,6 @@
         role: roleName,
         location: profileLocation,
         facebookUrl: facebook,
-        debug: preferredDebugSnapshot(debug, prev?.debug),
       });
     }
 

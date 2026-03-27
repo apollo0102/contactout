@@ -142,7 +142,6 @@ function mapExportRow(row) {
       linkedin,
       ...(facebook ? { facebook } : {}),
     },
-    ...(row?.debug && typeof row.debug === "object" ? { debug: row.debug } : {}),
   };
 }
 

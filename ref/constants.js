@@ -14,6 +14,8 @@
 const SEARCH_KEYWORD = "United States"
 // SEARCH_ROLE="Director of Strategy"
 const SEARCH_ROLE = "Director of Strategy"
+const SEARCH_ROLE_LIST = ["Director of Strategy", "Head of Engineering"]
+
 //First priority in search
 const SEARCH_GENDER_LIST = ["Male", "Female", "Unknown"]
 
