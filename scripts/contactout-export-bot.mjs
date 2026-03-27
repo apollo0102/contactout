@@ -353,6 +353,14 @@ function parseSearchIndustryListEnv() {
   ];
 }
 
+function parseJsonMergeCountEnv() {
+  const raw = process.env.JSON_MERGE_COUNT;
+  if (raw === undefined || String(raw).trim() === "") return 0;
+  const n = parseInt(String(raw).trim(), 10);
+  if (!Number.isFinite(n) || n < 1) return 0;
+  return n;
+}
+
 function normalizeGenderValue(value) {
   return String(value ?? "").trim().toLowerCase();
 }
@@ -1412,6 +1420,7 @@ function buildSearchPlans(ROOT, cli) {
           gender: multiGender ? "all-genders" : effectiveGenders[0],
         }),
         mergedDir: path.join(ROOT, "data", ...mergedFolderParts),
+        mergedFolderParts,
       });
 
       for (const gender of effectiveGenders) {
@@ -1573,6 +1582,14 @@ async function main() {
     process.env.MERGE_JSON != null
       ? !isEnvFalse("MERGE_JSON")
       : !isEnvFalse("MERGE_CSV");
+  const intermediateMergeCount = parseJsonMergeCountEnv();
+  const intermediateMergeRoot = path.resolve(
+    process.env.MERGED_DIRECTORY || path.join(ROOT, "data", "merged")
+  );
+  const writeIntermediateMerges = mergeJson && intermediateMergeCount > 0;
+  if (writeIntermediateMerges) {
+    fs.mkdirSync(intermediateMergeRoot, { recursive: true });
+  }
 
   const accountConfig = await loadAccountsConfig();
   const emailPool = accountConfig.emailPool;
@@ -1587,8 +1604,17 @@ async function main() {
   }
 
   let history = loadSearchHistory(historyPath);
+  const mergePlansByKey = new Map(
+    mergePlans.map((mergePlan) => [mergePlan.mergeKey, mergePlan])
+  );
   const rowsForMergeByKey = new Map(
     mergePlans.map((mergePlan) => [mergePlan.mergeKey, []])
+  );
+  const rowsForIntermediateMergeByKey = new Map(
+    mergePlans.map((mergePlan) => [
+      mergePlan.mergeKey,
+      { rows: [], pageFileCount: 0, batchIndex: 0 },
+    ])
   );
 
   const rotator = createProxyRotator();
@@ -1811,6 +1837,34 @@ async function main() {
   const searchEmployeeSizeList = parseSearchEmployeeSizeListEnv();
   const searchRevenueRanges = parseSearchRevenueRangesEnv();
   const searchIndustryList = parseSearchIndustryListEnv();
+
+  const writeIntermediateMergedJson = (mergePlan, reason = "threshold") => {
+    if (!writeIntermediateMerges) return false;
+    const state = rowsForIntermediateMergeByKey.get(mergePlan.mergeKey);
+    if (!state || state.pageFileCount === 0 || state.rows.length === 0) return false;
+
+    const merged = dedupeRowsByLinkedin(state.rows);
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    const middleDir = intermediateMergeRoot;
+    fs.mkdirSync(middleDir, { recursive: true });
+    state.batchIndex += 1;
+    const middlePath = path.join(
+      middleDir,
+      `contactout-middle-merged-${mergePlan.mergedSearchId.slice(0, 8)}${mergePlan.mergedExportNameSuffix}-batch-${String(state.batchIndex).padStart(4, "0")}-pages-${state.pageFileCount}-items-${merged.length}-${stamp}.json`
+    );
+    fs.writeFileSync(
+      middlePath,
+      buildJson(merged, { searchRole: mergePlan.role }),
+      "utf8"
+    );
+    console.log(
+      `[contactout-bot] Middle merged ${state.pageFileCount} page JSON file(s) for ${mergePlan.role || "default role"} -> ${merged.length} unique -> ${middlePath}${reason === "final-flush" ? " (final batch)" : ""}`
+    );
+    state.rows = [];
+    state.pageFileCount = 0;
+    rowsForIntermediateMergeByKey.set(mergePlan.mergeKey, state);
+    return true;
+  };
 
   const runSearchPlan = async (plan) => {
     const searchBaseUrl = normalizeSearchBaseUrl(plan.searchUrlRaw);
@@ -2165,6 +2219,20 @@ async function main() {
           const bucket = rowsForMergeByKey.get(plan.mergeKey) || [];
           bucket.push(...rows);
           rowsForMergeByKey.set(plan.mergeKey, bucket);
+          if (writeIntermediateMerges) {
+            const mergePlan = mergePlansByKey.get(plan.mergeKey);
+            const middleState = rowsForIntermediateMergeByKey.get(plan.mergeKey) || {
+              rows: [],
+              pageFileCount: 0,
+              batchIndex: 0,
+            };
+            middleState.rows.push(...rows);
+            middleState.pageFileCount += 1;
+            rowsForIntermediateMergeByKey.set(plan.mergeKey, middleState);
+            if (mergePlan && middleState.pageFileCount >= intermediateMergeCount) {
+              writeIntermediateMergedJson(mergePlan);
+            }
+          }
         }
         if (!ignoreSearchHistory) {
           markPageCompleted(history, searchId, searchBaseUrl, pageNum);
@@ -2223,6 +2291,12 @@ async function main() {
   try {
     for (const plan of searchPlans) {
       await runSearchPlan(plan);
+    }
+
+    if (writeIntermediateMerges) {
+      for (const mergePlan of mergePlans) {
+        writeIntermediateMergedJson(mergePlan, "final-flush");
+      }
     }
 
     if (mergeJson) {

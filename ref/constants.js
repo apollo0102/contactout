@@ -1,15 +1,3 @@
-//  EMAIL_USER=dev@glotanning.com
-// CONTACTOUT_PASSWORD=Glo123456
-
-// EMAIL_USER1=decentdev001@outlook.com
-// EMAIL_USER2=decentdev002@outlook.com
-// EMAIL_USER3=decentdev003@outlook.com
-
-// EMAIL_USER1=twin.rabbit0617@gmail.com
-// EMAIL_USER2=tainuepolob@gmail.com
-// EMAIL_USER3=isbsusigu@gmail.com
-// CONTACTOUT_PASSWORD=Sharkham617@
-
 // CONTACTOUT_PASSWORD=Glo123456!
 const SEARCH_COUNTRY_LIST = ["United States"]
 
@@ -199,7 +187,7 @@ const SEARCH_INDUSTRY = [
 ]
 
 
-const MAX_PAGES = 2
+const MAX_PAGES = 100
 const PROXIES_FILE = "./ref/proxies.txt"
 const PROXY_ROTATE_EVERY = 5
 const EMPTY_PAGE_RETRY_MAX = 3
@@ -208,6 +196,9 @@ const PROXY_429_SLEEP_AFTER_SWAP_MS = 3000
 const PROXY_HEALTH_CHECK = 0;
 const PROXY_HEALTH_CHECK_URL = "https://contactout.com/";
 const PROXY_HEALTH_TIMEOUT_MS = 25000;
+
+const JSON_MERGE_COUNT = 10
+const MERGED_DIRECTORY="./data/merged"
 
 export default {
     SEARCH_COUNTRY_LIST,
@@ -226,4 +217,6 @@ export default {
     PROXY_HEALTH_CHECK,
     PROXY_HEALTH_CHECK_URL,
     PROXY_HEALTH_TIMEOUT_MS,
+    JSON_MERGE_COUNT,
+    MERGED_DIRECTORY
 };
