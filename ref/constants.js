@@ -1,7 +1,7 @@
 // CONTACTOUT_PASSWORD=Glo123456!
 const SEARCH_COUNTRY_LIST = ["United States"]
 
-const SEARCH_ROLE_LIST = ["Engineering"]
+const SEARCH_ROLE_LIST = ["Engineering Manager", "Project Manager", "Operations Manager", "Sales Manager", "Marketing Manager", "Finance Manager", "Accounting Manager", "HR Manager", "Customer Success Manager", "Business Development Manager", "IT Manager", "Compliance Manager"]
 
 //First priority in search
 const SEARCH_GENDER_LIST = ["Male", "Female", "Unknown"]
@@ -30,13 +30,19 @@ const SEARCH_REVENUE = [
     { revenue_min: 100000, revenue_max: 250000 },
     { revenue_min: 250000, revenue_max: 500000 },
     { revenue_min: 500000, revenue_max: 1000000 },
-    { revenue_min: 1000000 }
+    
+    { revenue_min: 1000000, revenue_max: 5000000 },
+    { revenue_min: 5000000, revenue_max: 10000000 },
+    { revenue_min: 10000000, revenue_max: 50000000 },
+    { revenue_min: 50000000, revenue_max: 100000000 },
+    { revenue_min: 100000000, revenue_max: 500000000 },
+    { revenue_min: 500000000, revenue_max: 1000000000 },
+    { revenue_min: 1000000000 }
 ]
 
 //Sixth priority in search
 //industry
 const SEARCH_INDUSTRY = [
-    // "Defense & Space", "Computer Hardware", "Computer Software", "Computer Networking", "Internet"
     "Accounting",
     "Airlines/Aviation",
     "Alternative Dispute Resolution",

@@ -529,6 +529,38 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function parseIntWithFloor(raw, fallback, floor = 0) {
+  const n = parseInt(String(raw ?? "").trim(), 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(floor, n);
+}
+
+function envInt(name, fallback, floor = 0) {
+  return parseIntWithFloor(process.env[name], fallback, floor);
+}
+
+function randomIntBetween(min, max) {
+  const lo = Math.min(min, max);
+  const hi = Math.max(min, max);
+  return lo + Math.floor(Math.random() * (hi - lo + 1));
+}
+
+async function sleepRandom(minMs, maxMs) {
+  const delay = randomIntBetween(minMs, maxMs);
+  if (delay > 0) {
+    await sleep(delay);
+  }
+}
+
+function formatDuration(ms) {
+  const totalMs = Math.max(0, Math.floor(ms));
+  const totalSeconds = Math.ceil(totalMs / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
 /**
  * One proxy line/token: trim, strip `[` `]` / commas from bracket-style lists so
  * `socks5://user:pass@host:port` is parsed correctly (not `http://[socks5://...`).
@@ -657,6 +689,8 @@ function createProxyRotator() {
   }
   return {
     servers,
+    cooldownUntilByIndex: servers.map(() => 0),
+    failureCountByIndex: servers.map(() => 0),
     /** Local `http://127.0.0.1:port` URLs to pass to proxy-chain on shutdown */
     anonymizedLocalUrls: /** @type {string[]} */ ([]),
     rotateEvery,
@@ -664,19 +698,51 @@ function createProxyRotator() {
     get multi() {
       return this.servers.length > 1;
     },
+    currentIndex() {
+      return this.index % this.servers.length;
+    },
     current() {
-      return this.servers[this.index % this.servers.length];
+      return this.servers[this.currentIndex()];
+    },
+    cooldownMsFor(index) {
+      const until = this.cooldownUntilByIndex[index] || 0;
+      return Math.max(0, until - Date.now());
+    },
+    currentCooldownMs() {
+      return this.cooldownMsFor(this.currentIndex());
+    },
+    shortestCooldownMs() {
+      return this.cooldownUntilByIndex.reduce((min, until) => {
+        const ms = Math.max(0, until - Date.now());
+        return min === null || ms < min ? ms : min;
+      }, null);
+    },
+    markCooldown(ms, reason = "") {
+      const index = this.currentIndex();
+      const waitMs = Math.max(0, ms);
+      const nextUntil = Date.now() + waitMs;
+      this.cooldownUntilByIndex[index] = Math.max(
+        this.cooldownUntilByIndex[index] || 0,
+        nextUntil
+      );
+      this.failureCountByIndex[index] =
+        (this.failureCountByIndex[index] || 0) + 1;
+      if (waitMs > 0) {
+        console.warn(
+          `[proxy] Cooldown ${this.peekLabel(index)} for ${formatDuration(waitMs)}${reason ? ` (${reason})` : ""}`
+        );
+      }
     },
     advance() {
-      const prev = this.index % this.servers.length;
+      const prev = this.currentIndex();
       this.index += 1;
-      const next = this.index % this.servers.length;
+      const next = this.currentIndex();
       console.log(
         `[proxy] Switch ${prev} → ${next} (of ${this.servers.length})`
       );
     },
-    peekLabel() {
-      const p = this.current();
+    peekLabel(index = this.currentIndex()) {
+      const p = this.servers[index];
       try {
         return new URL(p.server).host;
       } catch {
@@ -790,16 +856,25 @@ async function proxyPassesHealthCheck(playwrightProxy) {
  * Advance rotator until current proxy passes health check or max skips.
  */
 async function skipUntilHealthyProxy(rotator, tag) {
-  if (isProxyHealthCheckDisabled()) return;
-
   const max = proxyHealthMaxSkips(rotator);
   let skipped = 0;
+  const healthCheckDisabled = isProxyHealthCheckDisabled();
 
   while (skipped < max) {
     const p = rotator.current();
     const label = rotator.peekLabel?.() || p.server;
+    const cooldownMs = rotator.currentCooldownMs?.() || 0;
 
-    if (await proxyPassesHealthCheck(p)) {
+    if (cooldownMs > 0) {
+      console.warn(
+        `[proxy] ${label} cooling down for ${formatDuration(cooldownMs)} (${tag})`
+      );
+      rotator.advance();
+      skipped += 1;
+      continue;
+    }
+
+    if (healthCheckDisabled || (await proxyPassesHealthCheck(p))) {
       if (skipped > 0) {
         console.log(
           `[proxy] Reachable after ${skipped} dead (${tag}) → ${label}`
@@ -815,8 +890,18 @@ async function skipUntilHealthyProxy(rotator, tag) {
     console.warn(
       `[proxy] Unreachable via ${label} — try next (${skipped + 1}/${max})`
     );
+    rotator.markCooldown?.(5 * 60_000, `health check failed: ${tag}`);
     rotator.advance();
     skipped += 1;
+  }
+
+  const shortestCooldownMs = rotator.shortestCooldownMs?.() || 0;
+  if (shortestCooldownMs > 0 && Number.isFinite(shortestCooldownMs)) {
+    console.warn(
+      `[proxy] All proxies are cooling down; waiting ${formatDuration(shortestCooldownMs)} (${tag})`
+    );
+    await sleep(shortestCooldownMs);
+    return skipUntilHealthyProxy(rotator, tag);
   }
 
   throw new Error(
@@ -991,7 +1076,7 @@ async function inspectSearchPageState(page) {
     const noResults = /no results|0 results|no people found|try adjusting your filters|we couldn'?t find/i.test(
       combined
     );
-    const blocked = /too many requests|rate limit|temporarily blocked|unusual traffic|access denied|verify you are human|captcha|security check|request unsuccessful/i.test(
+    const blocked = /(^|\b)403(\b|$)|403 forbidden|forbidden|too many requests|rate limit|temporarily blocked|unusual traffic|access denied|verify you are human|captcha|security check|request unsuccessful|attention required|please enable cookies/i.test(
       combined
     );
     return {
@@ -1594,14 +1679,44 @@ async function main() {
   const accountConfig = await loadAccountsConfig();
   const emailPool = accountConfig.emailPool;
   const accountPassword = accountConfig.password;
+  const accountRotateSuccessPages = envInt(
+    "ACCOUNT_ROTATE_SUCCESS_PAGES",
+    20,
+    1
+  );
+  const accountCooldownMs =
+    envInt("ACCOUNT_COOLDOWN_MINUTES", 72, 0) * 60_000;
+  const pageSettleDelayMinMs = envInt("PAGE_SETTLE_DELAY_MIN_MS", 1200, 0);
+  const pageSettleDelayMaxMs = envInt("PAGE_SETTLE_DELAY_MAX_MS", 2600, 0);
+  const pageGapDelayMinMs = envInt("PAGE_GAP_DELAY_MIN_MS", 900, 0);
+  const pageGapDelayMaxMs = envInt("PAGE_GAP_DELAY_MAX_MS", 2200, 0);
+  const pairSwitchDelayMinMs = envInt("PAIR_SWITCH_DELAY_MIN_MS", 2500, 0);
+  const pairSwitchDelayMaxMs = envInt("PAIR_SWITCH_DELAY_MAX_MS", 5000, 0);
+  const proxyBlockedCooldownMs = envInt(
+    "PROXY_BLOCKED_COOLDOWN_MS",
+    15 * 60_000,
+    0
+  );
+  const proxyFailureCooldownMs = envInt(
+    "PROXY_FAILURE_COOLDOWN_MS",
+    10 * 60_000,
+    0
+  );
   console.log(`[auth] Loaded accounts from ${accountConfig.source}`);
-  let emailIndex = 0;
-  const currentEmail = () => emailPool[emailIndex % emailPool.length];
-  if (emailPool.length > 1) {
-    console.log(
-      `[auth] ${emailPool.length} accounts (same password); on HTTP 429 the next email is used`
-    );
-  }
+  const accountStates = emailPool.map((email, index) => ({
+    index,
+    email,
+    activatedAt: 0,
+    cooldownUntil: 0,
+    successfulPages: 0,
+  }));
+  let activeAccountIndex = 0;
+  let successfulPagesOnCurrentAccount = 0;
+  const currentAccount = () => accountStates[activeAccountIndex % accountStates.length];
+  const currentEmail = () => currentAccount().email;
+  console.log(
+    `[auth] ${emailPool.length} account(s); rotate after ${accountRotateSuccessPages} successful pages, cooldown ${Math.round(accountCooldownMs / 60000)} minute(s)`
+  );
 
   let history = loadSearchHistory(historyPath);
   const mergePlansByKey = new Map(
@@ -1618,6 +1733,9 @@ async function main() {
   );
 
   const rotator = createProxyRotator();
+  const currentProxyLabel = () => (rotator ? rotator.peekLabel() : "direct");
+  const currentSessionLabel = () =>
+    `email=${currentEmail()} proxy=${currentProxyLabel()}`;
   const storageStatePath = path.join(userDataDir, "storage-state.json");
   fs.mkdirSync(userDataDir, { recursive: true });
   const backoff429 =
@@ -1637,28 +1755,7 @@ async function main() {
   /** @type {import("playwright").Page} */
   let page;
 
-  if (rotator) {
-    browser = await chromium.launch({ headless: envHeadless() });
-    await skipUntilHealthyProxy(rotator, "startup");
-    context = await browser.newContext({
-      viewport: { width: 1280, height: 800 },
-      proxy: rotator.current(),
-      ...(fs.existsSync(storageStatePath)
-        ? { storageState: storageStatePath }
-        : {}),
-    });
-    page = await context.newPage();
-    console.log(
-      `[proxy] ${rotator.servers.length} endpoint(s); first: ${rotator.peekLabel()}; rotate every ${rotator.rotateEvery || "429 only"} exports`
-    );
-  } else {
-    context = await chromium.launchPersistentContext(userDataDir, {
-      headless: envHeadless(),
-      viewport: { width: 1280, height: 800 },
-    });
-    page = context.pages()[0] || (await context.newPage());
-  }
-
+  let loggedIn = false;
   let pagesSinceRotate = 0;
 
   async function persistSession() {
@@ -1676,22 +1773,70 @@ async function main() {
     return v !== "0" && v !== "false" && v !== "no";
   }
 
+  function activateAccount(index, reason = "startup") {
+    activeAccountIndex =
+      ((index % accountStates.length) + accountStates.length) %
+      accountStates.length;
+    const account = currentAccount();
+    account.activatedAt = Date.now();
+    successfulPagesOnCurrentAccount = 0;
+    console.log(
+      `[auth] Active account ${activeAccountIndex + 1}/${accountStates.length}: ${account.email}${reason ? ` (${reason})` : ""}`
+    );
+  }
+
+  function markCurrentAccountCoolingDown(reason = "") {
+    const account = currentAccount();
+    if (!account) return;
+    const activatedAt = account.activatedAt || Date.now();
+    const nextAvailableAt = activatedAt + accountCooldownMs;
+    account.cooldownUntil = Math.max(account.cooldownUntil || 0, nextAvailableAt);
+    if (accountCooldownMs > 0) {
+      console.log(
+        `[auth] Cooldown ${account.email} until ${new Date(account.cooldownUntil).toISOString()}${reason ? ` (${reason})` : ""}`
+      );
+    }
+  }
+
+  function nextAvailableAccountIndex() {
+    const now = Date.now();
+    for (let offset = 1; offset <= accountStates.length; offset++) {
+      const index = (activeAccountIndex + offset) % accountStates.length;
+      if ((accountStates[index].cooldownUntil || 0) <= now) {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  function soonestAccountCooldownMs() {
+    return accountStates.reduce((min, account) => {
+      const ms = Math.max(0, (account.cooldownUntil || 0) - Date.now());
+      return min === null || ms < min ? ms : min;
+    }, null);
+  }
+
   /**
    * @param {string} reason
-   * @param {{ clearSession?: boolean }} [options] If clearSession, drop saved storage + cookies so the next context is clean (rate-limit / 429).
+   * @param {{ clearSession?: boolean, advanceProxy?: boolean }} [options]
    */
   async function recreateProxyContext(reason, options = {}) {
     const clearSession = Boolean(options.clearSession);
-    if (!rotator || !browser) return;
+    const advanceProxy = options.advanceProxy !== false;
 
-    try {
-      if (clearSession) {
-        await context.clearCookies();
-        console.log("[proxy] Cleared browser context cookies (fresh session).");
+    if (rotator) {
+      if (!browser) {
+        browser = await chromium.launch({ headless: envHeadless() });
       }
-    } catch {
-      /* ignore */
-    }
+
+      try {
+        if (clearSession && context) {
+          await context.clearCookies();
+          console.log("[proxy] Cleared browser context cookies (fresh session).");
+        }
+      } catch {
+        /* ignore */
+      }
 
     if (!clearSession) {
       await persistSession();
@@ -1700,7 +1845,7 @@ async function main() {
         if (fs.existsSync(storageStatePath)) {
           fs.unlinkSync(storageStatePath);
           console.log(
-            "[proxy] Deleted saved storage-state (no stale cookies after 429)."
+            "[proxy] Deleted saved storage-state (fresh session)."
           );
         }
       } catch {
@@ -1708,8 +1853,10 @@ async function main() {
       }
     }
 
-    await context.close();
-    rotator.advance();
+    await context?.close().catch(() => {});
+    if (advanceProxy) {
+      rotator.advance();
+    }
     await skipUntilHealthyProxy(rotator, reason);
 
     const useSavedState = !clearSession && fs.existsSync(storageStatePath);
@@ -1721,6 +1868,87 @@ async function main() {
     page = await context.newPage();
     console.log(
       `[proxy] New browser context (${reason}) → ${rotator.peekLabel()}`
+    );
+  }
+
+    else {
+      await context?.close().catch(() => {});
+      if (clearSession) {
+        try {
+          fs.rmSync(userDataDir, { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
+        fs.mkdirSync(userDataDir, { recursive: true });
+        console.log("[auth] Cleared persistent browser profile (fresh session).");
+      }
+      context = await chromium.launchPersistentContext(userDataDir, {
+        headless: envHeadless(),
+        viewport: { width: 1280, height: 800 },
+      });
+      page = context.pages()[0] || (await context.newPage());
+      console.log(`[auth] New browser context (${reason})`);
+    }
+    loggedIn = false;
+  }
+
+  async function rotateAccountProxyPair(reason, options = {}) {
+    const penalizeCurrentProxyMs = Math.max(0, options.penalizeCurrentProxyMs || 0);
+    const clearSession = options.clearSession !== false;
+
+    if (rotator && penalizeCurrentProxyMs > 0) {
+      rotator.markCooldown(penalizeCurrentProxyMs, reason);
+    }
+
+    markCurrentAccountCoolingDown(reason);
+
+    let nextIndex = nextAvailableAccountIndex();
+    if (nextIndex < 0) {
+      const waitMs = soonestAccountCooldownMs();
+      if (waitMs && Number.isFinite(waitMs) && waitMs > 0) {
+        console.log(
+          `[auth] All accounts cooling down; waiting ${formatDuration(waitMs)} before switching pairs.`
+        );
+        await sleep(waitMs);
+      }
+      nextIndex = nextAvailableAccountIndex();
+    }
+    if (nextIndex < 0) {
+      nextIndex = (activeAccountIndex + 1) % accountStates.length;
+    }
+
+    activateAccount(nextIndex, reason);
+    pagesSinceRotate = 0;
+    await recreateProxyContext(reason, {
+      clearSession,
+      advanceProxy: Boolean(rotator),
+    });
+    await sleepRandom(pairSwitchDelayMinMs, pairSwitchDelayMaxMs);
+  }
+
+  async function noteSuccessfulPageExport(reason = "successful page export") {
+    const account = currentAccount();
+    if (account) {
+      account.successfulPages += 1;
+    }
+    successfulPagesOnCurrentAccount += 1;
+    if (successfulPagesOnCurrentAccount >= accountRotateSuccessPages) {
+      await rotateAccountProxyPair(
+        `${reason}: reached ${successfulPagesOnCurrentAccount}/${accountRotateSuccessPages} successful pages`
+      );
+      return;
+    }
+    await sleepRandom(pageGapDelayMinMs, pageGapDelayMaxMs);
+  }
+
+  activateAccount(activeAccountIndex, "startup");
+  await recreateProxyContext("startup", {
+    clearSession: false,
+    advanceProxy: false,
+  });
+  if (rotator) {
+    console.log(
+      `[proxy] ${rotator.servers.length} endpoint(s); first: ${rotator.peekLabel()}; pair rotation budget ${accountRotateSuccessPages} successful pages`
     );
   }
 
@@ -1740,6 +1968,16 @@ async function main() {
     return /Timeout \d+ms exceeded/i.test(m);
   }
 
+  function isBlockedHttpStatus(status) {
+    return status === 403 || status === 429;
+  }
+
+  function blockedStatusLabel(status) {
+    if (status === 403) return "HTTP 403";
+    if (status === 429) return "HTTP 429";
+    return `HTTP ${status}`;
+  }
+
   const proxyFailoverCap = rotator
     ? Math.min(
         rotator.servers.length,
@@ -1751,10 +1989,11 @@ async function main() {
     : 0;
 
   async function gotoWith429Retry(targetUrl, label = "nav") {
-    const max429 = 6;
+    const maxBlocked = 6;
     let failoversForThisNav = 0;
+    const blockedStatuses = [];
 
-    for (let round = 0; round < max429; round++) {
+    for (let round = 0; round < maxBlocked; round++) {
       let resp = null;
 
       while (resp === null) {
@@ -1778,7 +2017,14 @@ async function main() {
             console.warn(
               `[proxy] ${label}: ${oneLine} — ${reason}, failover ${failoversForThisNav}/${proxyFailoverCap}`
             );
-            await recreateProxyContext(reason);
+            console.warn(
+              `[proxy] Failover session ${currentSessionLabel()}`
+            );
+            rotator?.markCooldown(proxyFailureCooldownMs, reason);
+            await recreateProxyContext(reason, {
+              clearSession: false,
+              advanceProxy: true,
+            });
             continue;
           }
           throw e;
@@ -1786,51 +2032,37 @@ async function main() {
       }
 
       const st = resp?.status();
-      if (st === 429) {
+      if (isBlockedHttpStatus(st)) {
+        blockedStatuses.push(st);
+        const statusLabel = blockedStatusLabel(st);
         console.warn(
-          `[contactout-bot] HTTP 429 on ${label} (round ${round + 1}/${max429}) — switch proxy, new context (no retry on same IP)`
+          `[contactout-bot] ${statusLabel} on ${label} (round ${round + 1}/${maxBlocked}) - rotate session/proxy before retry`
         );
-        const multiAccount = emailPool.length > 1;
-        if (multiAccount) {
-          emailIndex = (emailIndex + 1) % emailPool.length;
-          console.log(
-            `[auth] 429: next account ${emailIndex + 1}/${emailPool.length} → ${currentEmail()}`
-          );
-        }
-        const clearOn429 = envClearSessionOn429() || multiAccount;
-        if (rotator) {
-          await recreateProxyContext("HTTP 429", {
-            clearSession: clearOn429,
-          });
-          const afterSwap = parseInt(
-            process.env.PROXY_429_SLEEP_AFTER_SWAP_MS || "0",
-            10
-          );
-          if (Number.isFinite(afterSwap) && afterSwap > 0) {
-            await sleep(afterSwap);
-          }
-        } else {
-          if (multiAccount) {
-            try {
-              await context.clearCookies();
-              console.log("[auth] Cleared cookies (429, next account).");
-            } catch {
-              /* ignore */
-            }
-          }
-          await sleep(backoff429);
-        }
+        console.warn(
+          `[contactout-bot] Blocked session ${currentSessionLabel()}`
+        );
+        await rotateAccountProxyPair(statusLabel, {
+          clearSession: true,
+          penalizeCurrentProxyMs: proxyBlockedCooldownMs,
+        });
         continue;
+      }
+
+      if (Number.isFinite(st) && st >= 400) {
+        console.warn(
+          `[contactout-bot] HTTP ${st} on ${label}; continuing, but the page may be incomplete or blocked.`
+        );
       }
 
       await page.waitForLoadState("networkidle", { timeout: 60_000 }).catch(() => {});
       return resp;
     }
 
-    throw new Error(`Too many HTTP 429 responses (${label})`);
+    throw new Error(
+      `Too many blocked HTTP responses (${label}): ${blockedStatuses.join(", ")}`
+    );
   }
 
-  let loggedIn = false;
   const searchProfileThreshold = 2500;
   const searchYearsList = parseSearchYearsListEnv();
   const searchTotalYearsList = parseSearchTotalYearsListEnv();
@@ -1923,7 +2155,7 @@ async function main() {
       for (let attempt = 0; attempt <= emptyPageRetryMax; attempt++) {
         if (attempt > 0) {
           await reloadFirstSearchPage();
-          await sleep(2_000);
+          await sleepRandom(pageSettleDelayMinMs, pageSettleDelayMaxMs);
         }
 
         const profileCount = await extractProfileCount(page);
@@ -1940,14 +2172,18 @@ async function main() {
           console.warn(
             `[contactout-bot] Profile count not readable on first page; retry ${attempt + 1}/${emptyPageRetryMax}.`
           );
-          if (rotator && suspicious) {
-            await recreateProxyContext(
-              pageState.blocked || looksLikeLogin
-                ? "blocked first search page"
-                : "incomplete first search page",
-              { clearSession: pageState.blocked || looksLikeLogin }
-            );
-          } else if (!rotator && suspicious) {
+          if (suspicious && (pageState.blocked || looksLikeLogin)) {
+            await rotateAccountProxyPair("blocked first search page", {
+              clearSession: true,
+              penalizeCurrentProxyMs: proxyBlockedCooldownMs,
+            });
+          } else if (suspicious) {
+            rotator?.markCooldown(proxyFailureCooldownMs, "incomplete first search page");
+            await recreateProxyContext("incomplete first search page", {
+              clearSession: false,
+              advanceProxy: Boolean(rotator),
+            });
+          } else {
             await sleep(backoff429);
           }
           continue;
@@ -2171,7 +2407,7 @@ async function main() {
       }
       for (let attempt = 0; attempt <= emptyPageRetryMax; attempt++) {
         await gotoSearchPage(pageNum);
-        await sleep(2_000);
+        await sleepRandom(pageSettleDelayMinMs, pageSettleDelayMaxMs);
 
         const rows = await scrapeCurrentPageRows(page, plan.role);
         if (rows.length === 0) {
@@ -2184,15 +2420,20 @@ async function main() {
             console.warn(
               `[contactout-bot] Page ${pageNum} returned 0 rows but looks blocked/incomplete; retry ${attempt + 1}/${emptyPageRetryMax}.`
             );
-            if (rotator) {
-              await recreateProxyContext(
-                pageState.blocked || looksLikeLogin
-                  ? "blocked/empty result page"
-                  : "empty/incomplete result page",
-                { clearSession: pageState.blocked || looksLikeLogin }
-              );
+            if (pageState.blocked || looksLikeLogin) {
+              await rotateAccountProxyPair("blocked/empty result page", {
+                clearSession: true,
+                penalizeCurrentProxyMs: proxyBlockedCooldownMs,
+              });
             } else {
-              await sleep(backoff429);
+              rotator?.markCooldown(proxyFailureCooldownMs, "empty/incomplete result page");
+              await recreateProxyContext("empty/incomplete result page", {
+                clearSession: false,
+                advanceProxy: Boolean(rotator),
+              });
+              if (!rotator) {
+                await sleep(backoff429);
+              }
             }
             continue;
           }
@@ -2238,20 +2479,9 @@ async function main() {
           markPageCompleted(history, searchId, searchBaseUrl, pageNum);
           saveSearchHistory(historyPath, history);
         }
-        if (
-          rotator &&
-          rotator.multi &&
-          rotator.rotateEvery > 0
-        ) {
-          pagesSinceRotate += 1;
-          if (pagesSinceRotate >= rotator.rotateEvery) {
-            pagesSinceRotate = 0;
-            await persistSession();
-            await recreateProxyContext(
-              `PROXY_ROTATE_EVERY=${rotator.rotateEvery} pages`
-            );
-          }
-        }
+        await noteSuccessfulPageExport(
+          `page ${pageNum}${plan.role ? ` role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}`
+        );
         return { empty: false, rows };
       }
       return { empty: true, rows: [] };
