@@ -43,7 +43,10 @@ export const EMAIL_USER_LIST = [
     "crazydevstar004@outlook.com",
     "crazydevstar005@outlook.com",
     "crazydevstar006@outlook.com",
-    "crazydevstar007@outlook.com"
+    "crazydevstar007@outlook.com",
+    "crazydevstar008@outlook.com",
+    "crazydevstar009@outlook.com",
+    "crazydevstar010@outlook.com"
 ];
 
 export const CONTACTOUT_PASSWORD = "w123456789*";
