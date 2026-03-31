@@ -114,6 +114,101 @@ function buildJson(rows, options = {}) {
   return JSON.stringify(rows.map((row) => mapExportRow(row, options)), null, 2) + "\n";
 }
 
+function parseJsonArrayEnv(name) {
+  const raw = process.env[name]?.trim();
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return parsed.map((item) => String(item).trim()).filter(Boolean);
+    }
+  } catch {
+    /* fall through */
+  }
+  return raw
+    .split(/[\n,]+/)
+    .map((item) => String(item).trim().replace(/^['"]|['"]$/g, ""))
+    .filter(Boolean);
+}
+
+function splitNameFirstLast(fullName) {
+  const tokens = String(fullName || "")
+    .trim()
+    .split(/\s+/)
+    .map((token) => token.replace(/^[^A-Za-z]+|[^A-Za-z'-]+$/g, ""))
+    .filter(Boolean);
+  if (tokens.length < 2) return null;
+  return {
+    firstName: tokens[0],
+    lastName: tokens[tokens.length - 1],
+  };
+}
+
+function domainFromWebsite(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const url = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+    return url.hostname.replace(/^www\./i, "").trim().toLowerCase();
+  } catch {
+    return raw.replace(/^https?:\/\//i, "").replace(/^www\./i, "").split(/[/?#]/)[0].trim().toLowerCase();
+  }
+}
+
+function toFiniteConfidence(value) {
+  const n = typeof value === "number" ? value : parseFloat(String(value || "").trim());
+  return Number.isFinite(n) ? n : -1;
+}
+
+function pickBestEmailFinderCandidate(payload) {
+  const data = payload?.payload?.data;
+  if (!data || typeof data !== "object") return null;
+
+  const candidates = [];
+  if (data.address) {
+    candidates.push({
+      address: String(data.address).trim(),
+      confidence: toFiniteConfidence(data.confidence),
+      source: "address",
+    });
+  }
+  if (Array.isArray(data.relatedEmails)) {
+    for (const item of data.relatedEmails) {
+      const address = String(item?.address || "").trim();
+      if (!address) continue;
+      candidates.push({
+        address,
+        confidence: toFiniteConfidence(item?.confidence),
+        source: "relatedEmails",
+      });
+    }
+  }
+  if (!candidates.length) return null;
+
+  candidates.sort((a, b) => {
+    if (b.confidence !== a.confidence) return b.confidence - a.confidence;
+    if (a.source !== b.source) return a.source === "address" ? -1 : 1;
+    return a.address.localeCompare(b.address);
+  });
+  return candidates[0];
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+  const out = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.max(1, Math.min(limit, items.length || 1));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) return;
+      out[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
 function getSearchRoleValue(override = "") {
   const roleList = parseSearchRoleListEnv();
   return String(override || roleList[0] || "").trim();
@@ -135,6 +230,7 @@ function mapExportRow(row, options = {}) {
   const linkedin = String(row?.linkedinUrl || "").trim();
   const location = String(row?.location || "").trim();
   const workEmailDomain = String(row?.workEmailDomain || "").trim();
+  const email = String(row?.email || "").trim();
   const facebook = String(row?.facebookUrl || "").trim();
   const website = workEmailDomain
     ? /^https?:\/\//i.test(workEmailDomain)
@@ -147,6 +243,7 @@ function mapExportRow(row, options = {}) {
   return {
     business,
     full_name: fullName,
+    email,
     linkedin,
     location,
     website,
@@ -942,9 +1039,22 @@ function loadSearchHistory(historyPath) {
   }
 }
 
+function stringifySearchHistory(data) {
+  const base = JSON.stringify(data, null, 2);
+  return (
+    base.replace(
+      /"pagesCompleted": \[(.*?)\]/gs,
+      (_match, inner) => {
+        const items = [...inner.matchAll(/\d+/g)].map((m) => m[0]);
+        return `"pagesCompleted": [${items.join(", ")}]`;
+      }
+    ) + "\n"
+  );
+}
+
 function saveSearchHistory(historyPath, data) {
   fs.mkdirSync(path.dirname(historyPath), { recursive: true });
-  fs.writeFileSync(historyPath, JSON.stringify(data, null, 2), "utf8");
+  fs.writeFileSync(historyPath, stringifySearchHistory(data), "utf8");
 }
 
 function isPageCompleted(history, searchId, pageNum) {
@@ -1744,6 +1854,237 @@ async function main() {
     0,
     parseInt(process.env.EMPTY_PAGE_RETRY_MAX || "2", 10) || 2
   );
+  const rapidApiEmailFinderKey =
+    process.env.RAPID_API_EMAIL_FINDER?.trim() || "";
+  const truelistApiKeys = parseJsonArrayEnv("TRUELIST_API_KEYS");
+  const bannedWebsiteDomains = new Set(
+    parseJsonArrayEnv("BANNED_WEBSITE_DOMAIN").map((domain) =>
+      domainFromWebsite(domain)
+    ).filter(Boolean)
+  );
+  const truelistApiBaseUrl =
+    process.env.TRUELIST_API_BASE_URL?.trim() || "https://api.truelist.io";
+  const emailEnrichConcurrency = envInt("EMAIL_ENRICH_CONCURRENCY", 8, 1);
+  const emailFinderTimeoutMs = envInt("EMAIL_FINDER_TIMEOUT_MS", 20000, 1000);
+  const truelistTimeoutMs = envInt("TRUELIST_TIMEOUT_MS", 35000, 1000);
+  const rapidApiBaseUrl =
+    process.env.RAPID_API_EMAIL_FINDER_BASE_URL?.trim() ||
+    "https://email-finder7.p.rapidapi.com";
+  const emailFinderCache = new Map();
+  const emailValidationCache = new Map();
+  const truelistKeyStates = truelistApiKeys.map((token, index) => ({
+    index,
+    token,
+    cooldownUntil: 0,
+  }));
+  let truelistKeyIndex = 0;
+  console.log(
+    `[email] Email finder ${rapidApiEmailFinderKey ? "configured" : "missing"}; TrueList keys=${truelistApiKeys.length}; concurrency=${emailEnrichConcurrency}; banned domains=${bannedWebsiteDomains.size}`
+  );
+
+  async function fetchJsonWithTimeout(url, options, timeoutMs) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+      });
+      const text = await response.text();
+      let json = null;
+      if (text) {
+        try {
+          json = JSON.parse(text);
+        } catch {
+          json = null;
+        }
+      }
+      return { response, json, text };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function nextAvailableTruelistKeyState() {
+    if (!truelistKeyStates.length) return null;
+    const now = Date.now();
+    for (let offset = 0; offset < truelistKeyStates.length; offset++) {
+      const index = (truelistKeyIndex + offset) % truelistKeyStates.length;
+      const state = truelistKeyStates[index];
+      if ((state.cooldownUntil || 0) <= now) {
+        truelistKeyIndex = (index + 1) % truelistKeyStates.length;
+        return state;
+      }
+    }
+    return null;
+  }
+
+  function soonestTruelistCooldownMs() {
+    return truelistKeyStates.reduce((min, state) => {
+      const ms = Math.max(0, (state.cooldownUntil || 0) - Date.now());
+      return min === null || ms < min ? ms : min;
+    }, null);
+  }
+
+  function normalizeTruelistInlineResult(payload) {
+    const items = Array.isArray(payload?.emails) ? payload.emails : [];
+    if (!items.length) return null;
+    const first = items[0];
+    if (first?.email && typeof first.email === "object") return first.email;
+    if (typeof first === "object" && first) return first;
+    return null;
+  }
+
+  async function findCandidateEmailForRow(row) {
+    if (!rapidApiEmailFinderKey) return null;
+    const name = splitNameFirstLast(row?.fullName || "");
+    const domain = domainFromWebsite(row?.workEmailDomain || row?.website || "");
+    if (!name || !domain) return null;
+
+    const cacheKey = `${name.firstName.toLowerCase()}|${name.lastName.toLowerCase()}|${domain}`;
+    if (emailFinderCache.has(cacheKey)) {
+      return emailFinderCache.get(cacheKey);
+    }
+
+    const url =
+      `${rapidApiBaseUrl.replace(/\/+$/g, "")}/email-address/find-one/` +
+      `?personFirstName=${encodeURIComponent(name.firstName)}` +
+      `&personLastName=${encodeURIComponent(name.lastName)}` +
+      `&domain=${encodeURIComponent(domain)}`;
+
+    try {
+      const { response, json } = await fetchJsonWithTimeout(
+        url,
+        {
+          method: "GET",
+          headers: {
+            "Content-Type": "application/json",
+            "x-rapidapi-host": "email-finder7.p.rapidapi.com",
+            "x-rapidapi-key": rapidApiEmailFinderKey,
+          },
+        },
+        emailFinderTimeoutMs
+      );
+      if (!response.ok) {
+        console.warn(
+          `[email-finder] ${response.status} for ${name.firstName} ${name.lastName} @ ${domain}`
+        );
+        return null;
+      }
+      const candidate = pickBestEmailFinderCandidate(json);
+      emailFinderCache.set(cacheKey, candidate?.address || null);
+      return candidate?.address || null;
+    } catch (error) {
+      console.warn(
+        `[email-finder] Failed for ${name.firstName} ${name.lastName} @ ${domain}: ${String(error?.message || error)}`
+      );
+      return null;
+    }
+  }
+
+  async function validateEmailWithTrueList(email) {
+    const normalizedEmail = String(email || "").trim().toLowerCase();
+    if (!normalizedEmail || !truelistKeyStates.length) return false;
+    if (emailValidationCache.has(normalizedEmail)) {
+      return emailValidationCache.get(normalizedEmail);
+    }
+
+    const maxAttempts = Math.max(1, Math.min(truelistKeyStates.length, 3));
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      let keyState = nextAvailableTruelistKeyState();
+      if (!keyState) {
+        const waitMs = soonestTruelistCooldownMs();
+        if (waitMs && Number.isFinite(waitMs) && waitMs > 0) {
+          await sleep(waitMs);
+          keyState = nextAvailableTruelistKeyState();
+        }
+      }
+      if (!keyState) break;
+
+      const url =
+        `${truelistApiBaseUrl.replace(/\/+$/g, "")}/api/v1/verify_inline` +
+        `?email=${encodeURIComponent(normalizedEmail)}`;
+
+      try {
+        const { response, json } = await fetchJsonWithTimeout(
+          url,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${keyState.token}`,
+              "Content-Type": "application/json",
+            },
+          },
+          truelistTimeoutMs
+        );
+
+        if (response.status === 429) {
+          keyState.cooldownUntil = Date.now() + 60_000;
+          continue;
+        }
+        if (response.status === 408) {
+          continue;
+        }
+        if (!response.ok) {
+          break;
+        }
+
+        const result = normalizeTruelistInlineResult(json);
+        const ok = result?.email_sub_state === "email_ok";
+        emailValidationCache.set(normalizedEmail, ok);
+        return ok;
+      } catch (error) {
+        console.warn(
+          `[truelist] Failed for ${normalizedEmail}: ${String(error?.message || error)}`
+        );
+      }
+    }
+
+    return false;
+  }
+
+  async function enrichRowsWithValidatedEmails(rows, pageNum, plan) {
+    if (!rows.length) return [];
+    if (!rapidApiEmailFinderKey || !truelistKeyStates.length) {
+      console.warn(
+        `[email] Missing API keys; page ${pageNum} will not save profiles because validation is required.`
+      );
+      return [];
+    }
+
+    const enriched = await mapWithConcurrency(
+      rows,
+      emailEnrichConcurrency,
+      async (row) => {
+        const websiteDomain = domainFromWebsite(
+          row?.workEmailDomain || row?.website || ""
+        );
+        if (websiteDomain && bannedWebsiteDomains.has(websiteDomain)) {
+          console.log(
+            `[email] Skipped banned domain ${websiteDomain} for ${String(row?.fullName || "").trim()}`
+          );
+          return null;
+        }
+        const candidateEmail = await findCandidateEmailForRow(row);
+        if (!candidateEmail) return null;
+        const ok = await validateEmailWithTrueList(candidateEmail);
+        if (!ok) return null;
+        console.log(
+          `[email] Validateddddddddd profile ${String(row?.fullName || "").trim()} -> ${candidateEmail}`
+        );
+        return {
+          ...row,
+          email: candidateEmail,
+        };
+      }
+    );
+
+    const filtered = enriched.filter(Boolean);
+    console.log(
+      `[email] Page ${pageNum}${plan?.role ? ` role=${plan.role}` : ""}${plan?.gender ? ` gender=${plan.gender}` : ""}: validated ${filtered.length}/${rows.length} profile(s)`
+    );
+    return filtered;
+  }
 
   if (rotator) {
     await anonymizeSocksAuthProxiesForChromium(rotator);
@@ -2455,10 +2796,16 @@ async function main() {
         }
         lastPaginationFingerprint = fp;
 
-        exportPageToJson(pageNum, urlThis, rows);
-        if (rows.length > 0) {
+        const validatedRows = await enrichRowsWithValidatedEmails(
+          rows,
+          pageNum,
+          plan
+        );
+
+        if (validatedRows.length > 0) {
+          exportPageToJson(pageNum, urlThis, validatedRows);
           const bucket = rowsForMergeByKey.get(plan.mergeKey) || [];
-          bucket.push(...rows);
+          bucket.push(...validatedRows);
           rowsForMergeByKey.set(plan.mergeKey, bucket);
           if (writeIntermediateMerges) {
             const mergePlan = mergePlansByKey.get(plan.mergeKey);
@@ -2467,22 +2814,30 @@ async function main() {
               pageFileCount: 0,
               batchIndex: 0,
             };
-            middleState.rows.push(...rows);
+            middleState.rows.push(...validatedRows);
             middleState.pageFileCount += 1;
             rowsForIntermediateMergeByKey.set(plan.mergeKey, middleState);
             if (mergePlan && middleState.pageFileCount >= intermediateMergeCount) {
               writeIntermediateMergedJson(mergePlan);
             }
           }
+        } else {
+          console.log(
+            `[contactout-bot] Page ${pageNum} produced no validated emails; JSON file not written.`
+          );
         }
         if (!ignoreSearchHistory) {
           markPageCompleted(history, searchId, searchBaseUrl, pageNum);
           saveSearchHistory(historyPath, history);
         }
-        await noteSuccessfulPageExport(
-          `page ${pageNum}${plan.role ? ` role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}`
-        );
-        return { empty: false, rows };
+        if (validatedRows.length > 0) {
+          await noteSuccessfulPageExport(
+            `page ${pageNum}${plan.role ? ` role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}`
+          );
+        } else {
+          await sleepRandom(pageGapDelayMinMs, pageGapDelayMaxMs);
+        }
+        return { empty: false, rows: validatedRows };
       }
       return { empty: true, rows: [] };
     };

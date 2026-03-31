@@ -205,6 +205,33 @@ const PROXY_HEALTH_TIMEOUT_MS = 25000;
 
 const JSON_MERGE_COUNT = 10
 const MERGED_DIRECTORY="./data/merged"
+const RAPID_API_EMAIL_FINDER="59620721c8msh68873a42a2df9cfp193314jsnd519123e0bfc"
+const TRUELIST_API_KEYS=[
+    "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6ImEwMmEyMzA5LTIzNzktNDMzYy05NmU4LTI3OWMzMTVlNjI1ZSIsImV4cGlyZXNfYXQiOm51bGx9.aol07hKqYXicOlTYOzJ0Jgn9dNSSftM6C6ADG16sFT4",
+    "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6ImQ3N2JhYzJmLWVjMTEtNDY4MS05Y2VlLTVlNjdjMDc0MWJiZiIsImV4cGlyZXNfYXQiOm51bGx9.ZwbkXT5SSeHS3vfSyPpGfK7edLTeVZpbo3td-8cElq4",
+    "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6ImJlOGQzNTY1LWE2MDgtNDc2OC04ZTdiLTU3NDUzMGY4NDQxYSIsImV4cGlyZXNfYXQiOm51bGx9.8lc2hCZJ08skZOZiE2bdT62-FstRQXNON18YFVikBGs",
+    "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6ImIyNTllY2Q1LWE3ZjktNDI1ZS04ODVkLTA1ODNmMDI2MDdlOSIsImV4cGlyZXNfYXQiOm51bGx9.AJDksitf3z9PeXLoLR2fPvtKf6ggFEARxwYZMWdg_30",
+    "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6Ijc2MDBhNDc0LThmN2YtNDQwMy1hYmJjLThjNjk3N2JiN2E2NSIsImV4cGlyZXNfYXQiOm51bGx9.wqx99CyXHzWTu5Uvht57MWSv1dhwDWzrFk4mXgU1zv0"
+]
+
+const BANNED_WEBSITE_DOMAIN=
+['gmail.com', 'googlemail.com', 'yahoo.com', 'yahoo.co.uk', 'yahoo.fr',
+'outlook.com', 'hotmail.com', 'live.com', 'msn.com',
+'aol.com', 'mail.com', 'protonmail.com', 'proton.me',
+'icloud.com', 'me.com', 'mac.com',
+'zoho.com', 'yandex.com', 'gmx.com', 'mail.ru', '10minutemail.com', 'guerrillamail.com', 'mailinator.com', 'tempmail.org',
+'throwaway.email', 'temp-mail.org', 'yopmail.com', 'getnada.com',
+"tempmail.com", "throwaway.com", "mailinator.com", "10minutemail.com",
+"guerrillamail.com", "guerrillamail.net", "guerrillamail.org",
+"sharklasers.com", "spam4.me", "grr.la", "guerrillamailblock.com",
+"pokemail.net", "spam.la", "maildrop.cc", "yopmail.com", "yopmail.fr",
+"trashmail.com", "trashmail.net", "fakeinbox.com", "tempinbox.com",
+"discard.email", "throwawaymail.com", "getnada.com", "emailondeck.com",
+"tempail.com", "tempmailaddress.com", "burnermail.io", "mytrashmail.com",
+"33mail.com", "temp-mail.org", "10minemail.com", "dropmail.me",
+"mohmal.com", "guerrilla-mail.com", "crazymailing.com", "tempr.email",
+"dispostable.com", "fakemail.net", "inboxkitten.com", "minutemail.com"
+]
 
 export default {
     SEARCH_COUNTRY_LIST,
@@ -224,5 +251,8 @@ export default {
     PROXY_HEALTH_CHECK_URL,
     PROXY_HEALTH_TIMEOUT_MS,
     JSON_MERGE_COUNT,
-    MERGED_DIRECTORY
+    MERGED_DIRECTORY,
+    RAPID_API_EMAIL_FINDER,
+    TRUELIST_API_KEYS,
+    BANNED_WEBSITE_DOMAIN
 };

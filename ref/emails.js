@@ -9,10 +9,8 @@
 
 export const EMAIL_USER_LIST = [
     "cierasummeier283101@outlook.com",
-	"chrisslater0231@outlook.com",
 	"macireando@outlook.com",
 	"meaganrainier2026@outlook.com",
-	"AshleyW2123@outlook.com",
 	"kileyheadley@outlook.com",
 	"maryjothom@outlook.com",
 	"FlaviaGabriella1997@outlook.com",
