@@ -1,12 +1,3 @@
-// export const EMAIL_USER_LIST = [
-//   "twin.rabbit0617@gmail.com",
-//   "tainuepolob@gmail.com",
-//   "isbsusigu@gmail.com",
-// ];
-
-// export const CONTACTOUT_PASSWORD = "Sharkham617@";
-
-
 export const EMAIL_USER_FIRST_LIST = [
   "kristi-hadley-a872b654@outlook.com",
   "armando-gaytan-0b8502101@outlook.com",
