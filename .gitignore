@@ -7,3 +7,4 @@ playwright-user-data/
 exports/
 data/
 # ref/search-history.json
+ref/search-history/
