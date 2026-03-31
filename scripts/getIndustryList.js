@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { chromium } from "playwright";
+import { loadEmailConfig } from "./workerConfig.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -26,16 +27,15 @@ async function loadConstants() {
 }
 
 async function loadAccounts() {
-  const mod = await import(pathToFileURL(EMAILS_CONFIG_PATH).href);
-  const emailPool = Array.isArray(mod.EMAIL_USER_LIST)
-    ? mod.EMAIL_USER_LIST.map((s) => String(s).trim()).filter(Boolean)
-    : [];
-  const password =
-    typeof mod.CONTACTOUT_PASSWORD === "string"
-      ? mod.CONTACTOUT_PASSWORD.trim()
-      : "";
+  const preferredGender = normalizeGenderValue(process.env.CONTACTOUT_WORKER_GENDER);
+  const workerSlotRaw = process.env.CONTACTOUT_WORKER_SLOT?.trim() || "";
+  const { emailPool, password } = await loadEmailConfig({
+    fresh: true,
+    workerSlot: workerSlotRaw,
+    workerGender: preferredGender,
+  });
   if (!emailPool.length || !password) {
-    throw new Error("Missing EMAIL_USER_LIST or CONTACTOUT_PASSWORD in ref/emails.js");
+    throw new Error("Missing login emails or CONTACTOUT_PASSWORD in ref/emails.js");
   }
   return { email: emailPool[0], password };
 }

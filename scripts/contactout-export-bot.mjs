@@ -72,12 +72,25 @@
  */
 import "dotenv/config";
 import crypto from "node:crypto";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { chromium, request as apiRequest } from "playwright";
 import ProxyChain from "proxy-chain";
-import { maybeRefreshProxyFileFromLocalList } from "./proxyUtils.js";
+import {
+  maybeRefreshProxyFileFromLocalList,
+  validateProxyLines,
+} from "./proxyUtils.js";
+import {
+  EMAILS_CONFIG_PATH,
+  LEGACY_PROXIES_FILE_PATH,
+  loadEmailConfig,
+  loadProxyConfig,
+  normalizeWorkerSlot,
+  workerSlotLabel,
+  saveEmailPoolToConfigFile as persistEmailPoolToConfigFile,
+} from "./workerConfig.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -85,9 +98,8 @@ const SCRAPE_DOM_EVAL_PATH = path.join(
   __dirname,
   "contactout-scrape-dom-eval.js"
 );
-const EMAILS_CONFIG_PATH = path.join(ROOT, "ref", "emails.js");
 const CONSTANTS_CONFIG_PATH = path.join(ROOT, "ref", "constants.js");
-const DEFAULT_PROXIES_FILE = path.join(ROOT, "ref", "proxies.txt");
+const DEFAULT_PROXIES_FILE = LEGACY_PROXIES_FILE_PATH;
 
 /** Same DOM scrape as `contactout_extension/content.js` (keep in sync with that file). */
 let scrapeDomEvalSource = "";
@@ -586,23 +598,19 @@ function parseEmailPoolFromEnv() {
 }
 
 async function loadAccountsConfig(options = {}) {
-  const fresh = Boolean(options.fresh);
+  const workerSlot = normalizeWorkerSlot(
+    options.workerSlot ?? process.env.CONTACTOUT_WORKER_SLOT
+  );
   if (fs.existsSync(EMAILS_CONFIG_PATH)) {
-    const configUrl = pathToFileURL(EMAILS_CONFIG_PATH);
-    if (fresh) {
-      configUrl.searchParams.set("t", String(Date.now()));
-    }
-    const mod = await import(configUrl.href);
-    const emailPool = Array.isArray(mod.EMAIL_USER_LIST)
-      ? [...new Set(mod.EMAIL_USER_LIST.map((s) => String(s).trim()).filter(Boolean))]
-      : [];
-    const password =
-      typeof mod.CONTACTOUT_PASSWORD === "string"
-        ? mod.CONTACTOUT_PASSWORD.trim()
-        : "";
+    const config = await loadEmailConfig({
+      fresh: Boolean(options.fresh),
+      workerSlot,
+    });
+    const emailPool = [...new Set(config.emailPool.map((s) => String(s).trim()).filter(Boolean))];
+    const password = String(config.password || "").trim();
     if (!emailPool.length) {
       throw new Error(
-        `Account config file is missing EMAIL_USER_LIST entries: ${EMAILS_CONFIG_PATH}`
+        `Account config file is missing login emails${workerSlot ? ` for worker slot ${workerSlot}` : ""}: ${EMAILS_CONFIG_PATH}`
       );
     }
     if (!password) {
@@ -610,7 +618,13 @@ async function loadAccountsConfig(options = {}) {
         `Account config file is missing CONTACTOUT_PASSWORD: ${EMAILS_CONFIG_PATH}`
       );
     }
-    return { emailPool, password, source: EMAILS_CONFIG_PATH };
+    return {
+      emailPool,
+      password,
+      source: EMAILS_CONFIG_PATH,
+      workerSlot,
+      bindingName: config.bindingName,
+    };
   }
 
   const emailPool = parseEmailPoolFromEnv();
@@ -625,24 +639,20 @@ async function loadAccountsConfig(options = {}) {
       `No login password: create ${EMAILS_CONFIG_PATH} or set CONTACTOUT_PASSWORD`
     );
   }
-  return { emailPool, password, source: "environment variables" };
+  return {
+    emailPool,
+    password,
+    source: "environment variables",
+    workerSlot,
+    bindingName: "EMAIL_USER_LIST",
+  };
 }
 
-function formatEmailUserListSource(emailPool) {
-  if (!emailPool.length) return "[]";
-  return `[\n${emailPool.map((email) => `    ${JSON.stringify(String(email).trim())}`).join(",\n")}\n]`;
-}
-
-function saveEmailPoolToConfigFile(emailPool) {
-  const raw = fs.readFileSync(EMAILS_CONFIG_PATH, "utf8");
-  const next = raw.replace(
-    /^export const EMAIL_USER_LIST\s*=\s*\[(.*?)\];/ms,
-    `export const EMAIL_USER_LIST = ${formatEmailUserListSource(emailPool)};`
-  );
-  if (next === raw) {
-    throw new Error(`Could not update EMAIL_USER_LIST in ${EMAILS_CONFIG_PATH}`);
-  }
-  fs.writeFileSync(EMAILS_CONFIG_PATH, next, "utf8");
+function saveEmailPoolToConfigFile(emailPool, options = {}) {
+  persistEmailPoolToConfigFile(emailPool, {
+    workerSlot: options.workerSlot,
+    bindingName: options.bindingName,
+  });
 }
 
 function sleep(ms) {
@@ -750,8 +760,9 @@ function parseProxiesRawBlock(raw) {
 /**
  * Proxies from `PROXIES_FILE` (e.g. Proxifly export) and/or `PROXIES` (merged, deduped).
  */
-function parseProxiesEnvArray() {
+async function parseProxiesEnvArray() {
   const blocks = [];
+  const workerSlot = normalizeWorkerSlot(process.env.CONTACTOUT_WORKER_SLOT);
   const pathFile = process.env.PROXIES_FILE?.trim();
   const abs = pathFile
     ? path.isAbsolute(pathFile)
@@ -760,6 +771,13 @@ function parseProxiesEnvArray() {
     : DEFAULT_PROXIES_FILE;
   if (fs.existsSync(abs)) {
     blocks.push(fs.readFileSync(abs, "utf8"));
+  }
+  const proxyConfig = await loadProxyConfig({
+    fresh: true,
+    workerSlot,
+  });
+  if (proxyConfig.proxyLines.length) {
+    blocks.push(JSON.stringify(proxyConfig.proxyLines));
   }
   const env = process.env.PROXIES?.trim();
   if (env) blocks.push(env);
@@ -773,14 +791,24 @@ function parseProxiesEnvArray() {
   return [...new Set(merged)];
 }
 
-function parseProxyLinesFromEnv() {
+async function parseProxyLinesFromEnv() {
   const lines = [];
-  lines.push(...parseProxiesEnvArray());
+  const validatedOnly = envTruthy(
+    String(process.env.CONTACTOUT_VALIDATED_PROXY_LIST || "").trim().toLowerCase()
+  );
+  if (!validatedOnly) {
+    lines.push(...(await parseProxiesEnvArray()));
+  }
   const file = process.env.PROXY_LIST_FILE?.trim();
-  if (file && fs.existsSync(file)) {
+  const resolvedFile = file
+    ? path.isAbsolute(file)
+      ? file
+      : path.resolve(ROOT, file)
+    : "";
+  if (resolvedFile && fs.existsSync(resolvedFile)) {
     lines.push(
       ...fs
-        .readFileSync(file, "utf8")
+        .readFileSync(resolvedFile, "utf8")
         .split(/\r?\n/)
         .map((l) => cleanProxyToken(l))
     );
@@ -797,8 +825,8 @@ function parseProxyLinesFromEnv() {
 /**
  * @returns {{ servers: object[], rotateEvery: number, index: number, multi: boolean } | null}
  */
-function createProxyRotator() {
-  const parts = parseProxyLinesFromEnv();
+async function createProxyRotator() {
+  const parts = await parseProxyLinesFromEnv();
   if (!parts.length) return null;
   const servers = parts.map(toPlaywrightProxy);
   const rawRe = process.env.PROXY_ROTATE_EVERY;
@@ -1612,9 +1640,14 @@ function buildSearchPlans(ROOT, cli) {
   const countryList = parseSearchCountryListEnv();
   const genderList = parseSearchGenderListEnv();
   const roleList = parseSearchRoleListEnv();
+  const workerRole = String(process.env.CONTACTOUT_WORKER_ROLE || "").trim();
   const countries = countryList.length ? countryList : [getSearchCountryValue()].filter(Boolean);
   const effectiveCountries = countries.length ? countries : ["United States"];
-  const roles = roleList.length ? roleList : [getSearchRoleValue()].filter(Boolean);
+  const roles = workerRole
+    ? [workerRole]
+    : roleList.length
+      ? roleList
+      : [getSearchRoleValue()].filter(Boolean);
   const effectiveRoles = roles.length ? roles : [""];
   const normalizedGenders = genderList.length
     ? [...new Set(genderList.map((gender) => normalizeGenderValue(gender)))]
@@ -1771,16 +1804,181 @@ async function setLocationUnitedStates(page, locationLabel) {
   await page.waitForLoadState("networkidle", { timeout: 45_000 }).catch(() => {});
 }
 
-async function main() {
-  await loadConstantsConfigToEnv();
-  try {
-    const proxyRefreshResult = await maybeRefreshProxyFileFromLocalList({
-      rootDir: ROOT,
+function runtimeWorkerKey(workerSlot = 0) {
+  const normalized = normalizeWorkerSlot(workerSlot);
+  return normalized ? `slot-${normalized}` : "default";
+}
+
+function makeFileStamp(value = new Date()) {
+  return new Date(value).toISOString().slice(0, 19).replace(/[:T]/g, "-");
+}
+
+function workerSlotDisplay(workerSlot = 0) {
+  const normalized = normalizeWorkerSlot(workerSlot);
+  if (!normalized) return "default worker";
+  const label = workerSlotLabel(normalized);
+  return label ? `worker slot ${normalized} (${label})` : `worker slot ${normalized}`;
+}
+
+function defaultHistoryPathForWorker(rootDir, workerSlot = 0) {
+  const normalized = normalizeWorkerSlot(workerSlot);
+  if (!normalized) {
+    return path.join(rootDir, "ref", "search-history.json");
+  }
+  return path.join(
+    rootDir,
+    "ref",
+    "search-history",
+    `search-history-slot-${normalized}.json`
+  );
+}
+
+function rawExportRootForWorker(exportDir, workerSlot = 0) {
+  return path.join(exportDir, "_raw", runtimeWorkerKey(workerSlot));
+}
+
+function parseRequestedSearchRoles() {
+  const roles = parseSearchRoleListEnv();
+  if (roles.length) {
+    return [...new Set(roles.map((role) => String(role || "").trim()).filter(Boolean))];
+  }
+  const singleRole = getSearchRoleValue();
+  return singleRole ? [singleRole] : [];
+}
+
+function parseMaxBrowserCount() {
+  const raw = process.env.MAX_BROWSER_COUNT?.trim();
+  if (!raw) return 1;
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return 1;
+  return Math.max(1, parsed);
+}
+
+async function resolveRoleWorkerSlots(maxBrowserCount) {
+  const workerCount = Math.max(1, Math.min(parseInt(String(maxBrowserCount), 10) || 1, 3));
+  const slots = [];
+  for (let slot = 1; slot <= workerCount; slot += 1) {
+    const emailConfig = await loadEmailConfig({ fresh: true, workerSlot: slot });
+    const proxyConfig = await loadProxyConfig({ fresh: true, workerSlot: slot });
+    if (!emailConfig.emailPool.length) {
+      throw new Error(`Missing login emails for ${workerSlotDisplay(slot)} in ref/emails.js.`);
+    }
+    if (!proxyConfig.proxyLines.length) {
+      throw new Error(`Missing proxies for ${workerSlotDisplay(slot)} in ref/proxies.js.`);
+    }
+    slots.push(slot);
+  }
+  return slots;
+}
+
+async function runRoleWorkerChildProcess(workerSlot, workerRole, cliArgs) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [process.argv[1], ...cliArgs], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        CONTACTOUT_WORKER_SLOT: String(workerSlot),
+        CONTACTOUT_WORKER_ROLE: workerRole,
+        CONTACTOUT_ORCHESTRATED_WORKER: "1",
+      },
+      stdio: "inherit",
+    });
+
+    child.on("error", reject);
+    child.on("close", (code, signal) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(
+        new Error(
+          `${workerSlotDisplay(workerSlot)} for role "${workerRole}" exited with code ${code ?? "null"}${signal ? ` (signal ${signal})` : ""}.`
+        )
+      );
+    });
+  });
+}
+
+async function maybeRunRoleWorkers() {
+  if (process.env.CONTACTOUT_WORKER_ROLE?.trim()) {
+    return false;
+  }
+
+  const requestedRoles = parseRequestedSearchRoles();
+  const maxBrowserCount = parseMaxBrowserCount();
+  if (requestedRoles.length < 2 || maxBrowserCount <= 1) {
+    return false;
+  }
+
+  const workerSlots = await resolveRoleWorkerSlots(Math.min(maxBrowserCount, requestedRoles.length));
+  let nextRoleIndex = 0;
+  await Promise.all(
+    workerSlots.map(async (slot) => {
+      while (true) {
+        if (nextRoleIndex >= requestedRoles.length) break;
+        const role = requestedRoles[nextRoleIndex];
+        nextRoleIndex += 1;
+        console.log(`[worker] ${workerSlotDisplay(slot)} -> role "${role}"`);
+        await runRoleWorkerChildProcess(slot, role, process.argv.slice(2));
+      }
+    })
+  );
+  return true;
+}
+
+async function runProxyPreflight(workerSlot = 0) {
+  const normalizedSlot = normalizeWorkerSlot(workerSlot);
+  const workerProxyConfig = await loadProxyConfig({
+    fresh: true,
+    workerSlot: normalizedSlot,
+  });
+
+  if (workerProxyConfig.proxyLines.length) {
+    const validation = await validateProxyLines(workerProxyConfig.proxyLines, {
       logger: console,
     });
-    if (proxyRefreshResult?.skipped) {
-      console.log(`[proxy] Proxy preflight skipped: ${proxyRefreshResult.reason}`);
+    if (validation?.skipped) {
+      console.log(`[proxy] Proxy preflight skipped: ${validation.reason}`);
+      process.env.PROXY_LIST = workerProxyConfig.proxyLines.join("\n");
+      process.env.CONTACTOUT_VALIDATED_PROXY_LIST = "1";
+      return;
     }
+    if (!validation.healthyLines.length) {
+      throw new Error(
+        `Proxy validation produced 0 healthy proxy endpoints${normalizedSlot ? ` for ${workerSlotDisplay(normalizedSlot)}` : ""}.`
+      );
+    }
+    process.env.PROXY_LIST = validation.healthyLines.join("\n");
+    process.env.CONTACTOUT_VALIDATED_PROXY_LIST = "1";
+    return;
+  }
+
+  const proxyRefreshResult = await maybeRefreshProxyFileFromLocalList({
+    rootDir: ROOT,
+    logger: console,
+  });
+  if (proxyRefreshResult?.skipped) {
+    console.log(`[proxy] Proxy preflight skipped: ${proxyRefreshResult.reason}`);
+  }
+}
+
+async function main() {
+  await loadConstantsConfigToEnv();
+  const cli = parseCliArgs(process.argv.slice(2));
+  if (cli.help) {
+    printCliHelp();
+    return;
+  }
+
+  if (await maybeRunRoleWorkers()) {
+    return;
+  }
+
+  const workerSlot = normalizeWorkerSlot(process.env.CONTACTOUT_WORKER_SLOT);
+  const workerKey = runtimeWorkerKey(workerSlot);
+
+  try {
+    await runProxyPreflight(workerSlot);
   } catch (error) {
     console.warn(
       `[proxy] Proxy preflight failed; using existing proxy sources. ${error?.message || error}`
@@ -1788,17 +1986,13 @@ async function main() {
   }
   loadScrapeDomEval();
 
-  const cli = parseCliArgs(process.argv.slice(2));
-  if (cli.help) {
-    printCliHelp();
-    return;
-  }
-
-  const userDataDir = path.join(ROOT, "playwright-user-data");
+  const userDataDir = path.join(ROOT, "playwright-user-data", workerKey);
   const exportDir = path.resolve(
     process.env.EXPORT_DIR || path.join(ROOT, "exports")
   );
   fs.mkdirSync(exportDir, { recursive: true });
+  const rawExportRoot = rawExportRootForWorker(exportDir, workerSlot);
+  fs.mkdirSync(rawExportRoot, { recursive: true });
 
   const { plans: searchPlans, mergePlans } = buildSearchPlans(ROOT, cli);
   const startPage = parseStartPageEnv();
@@ -1806,7 +2000,7 @@ async function main() {
   const unlimitedPages = maxPages === 0;
 
   const historyPath = path.resolve(
-    process.env.SEARCH_HISTORY_PATH || path.join(ROOT, "ref", "search-history.json")
+    process.env.SEARCH_HISTORY_PATH || defaultHistoryPathForWorker(ROOT, workerSlot)
   );
   const historyDir = path.dirname(historyPath);
   fs.mkdirSync(historyDir, { recursive: true });
@@ -1830,11 +2024,12 @@ async function main() {
     fs.mkdirSync(intermediateMergeRoot, { recursive: true });
   }
 
-  const accountConfig = await loadAccountsConfig();
+  const accountConfig = await loadAccountsConfig({ workerSlot });
   const emailPool = accountConfig.emailPool;
   let accountPassword = accountConfig.password;
   const accountConfigSource = accountConfig.source;
   const canEditAccountConfig = accountConfigSource === EMAILS_CONFIG_PATH;
+  const accountConfigBindingName = accountConfig.bindingName;
   const accountRotateSuccessPages = envInt(
     "ACCOUNT_ROTATE_SUCCESS_PAGES",
     20,
@@ -1870,7 +2065,9 @@ async function main() {
   let successfulPagesOnCurrentAccount = 0;
   const currentAccount = () => {
     if (!accountStates.length) {
-      throw new Error("No active accounts remain in EMAIL_USER_LIST.");
+      throw new Error(
+        `No active accounts remain${workerSlot ? ` for ${workerSlotDisplay(workerSlot)}` : ""}.`
+      );
     }
     const safeIndex =
       ((activeAccountIndex % accountStates.length) + accountStates.length) %
@@ -1879,7 +2076,7 @@ async function main() {
   };
   const currentEmail = () => currentAccount().email;
   console.log(
-    `[auth] ${emailPool.length} account(s); rotate after ${accountRotateSuccessPages} successful pages, cooldown ${Math.round(accountCooldownMs / 60000)} minute(s)`
+    `[auth] ${emailPool.length} account(s)${workerSlot ? ` for ${workerSlotDisplay(workerSlot)}` : ""}; rotate after ${accountRotateSuccessPages} successful pages, cooldown ${Math.round(accountCooldownMs / 60000)} minute(s)`
   );
 
   let history = loadSearchHistory(historyPath);
@@ -1896,7 +2093,7 @@ async function main() {
     ])
   );
 
-  const rotator = createProxyRotator();
+  const rotator = await createProxyRotator();
   const currentProxyLabel = () => (rotator ? rotator.peekLabel() : "direct");
   const currentSessionLabel = () =>
     `email=${currentEmail()} proxy=${currentProxyLabel()}`;
@@ -1915,8 +2112,21 @@ async function main() {
     0,
     parseInt(process.env.EMPTY_PAGE_RETRY_MAX || "2", 10) || 2
   );
-  const rapidApiEmailFinderKey =
+  const rapidApiEmailFinderKeysFromList = parseJsonArrayEnv(
+    "RAPID_API_EMAIL_FINDER_LIST"
+  );
+  const rapidApiEmailFinderSingleKey =
     process.env.RAPID_API_EMAIL_FINDER?.trim() || "";
+  const rapidApiEmailFinderKeys = [
+    ...new Set(
+      [
+        ...rapidApiEmailFinderKeysFromList,
+        ...(rapidApiEmailFinderSingleKey ? [rapidApiEmailFinderSingleKey] : []),
+      ]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean)
+    ),
+  ];
   const truelistApiKeys = parseJsonArrayEnv("TRUELIST_API_KEYS");
   const bannedWebsiteDomains = new Set(
     parseJsonArrayEnv("BANNED_WEBSITE_DOMAIN").map((domain) =>
@@ -1933,14 +2143,22 @@ async function main() {
     "https://email-finder7.p.rapidapi.com";
   const emailFinderCache = new Map();
   const emailValidationCache = new Map();
+  const rapidApiEmailFinderKeyStates = rapidApiEmailFinderKeys.map(
+    (token, index) => ({
+      index,
+      token,
+      cooldownUntil: 0,
+    })
+  );
   const truelistKeyStates = truelistApiKeys.map((token, index) => ({
     index,
     token,
     cooldownUntil: 0,
   }));
+  let rapidApiEmailFinderKeyIndex = 0;
   let truelistKeyIndex = 0;
   console.log(
-    `[email] Email finder ${rapidApiEmailFinderKey ? "configured" : "missing"}; TrueList keys=${truelistApiKeys.length}; concurrency=${emailEnrichConcurrency}; banned domains=${bannedWebsiteDomains.size}`
+    `[email] Email finder keys=${rapidApiEmailFinderKeyStates.length}; TrueList keys=${truelistApiKeys.length}; concurrency=${emailEnrichConcurrency}; banned domains=${bannedWebsiteDomains.size}`
   );
 
   async function fetchJsonWithTimeout(url, options, timeoutMs) {
@@ -1980,6 +2198,28 @@ async function main() {
     return null;
   }
 
+  function nextAvailableRapidApiEmailFinderKeyState() {
+    if (!rapidApiEmailFinderKeyStates.length) return null;
+    const now = Date.now();
+    for (let offset = 0; offset < rapidApiEmailFinderKeyStates.length; offset++) {
+      const index =
+        (rapidApiEmailFinderKeyIndex + offset) % rapidApiEmailFinderKeyStates.length;
+      const state = rapidApiEmailFinderKeyStates[index];
+      if ((state.cooldownUntil || 0) <= now) {
+        rapidApiEmailFinderKeyIndex = (index + 1) % rapidApiEmailFinderKeyStates.length;
+        return state;
+      }
+    }
+    return null;
+  }
+
+  function soonestRapidApiEmailFinderCooldownMs() {
+    return rapidApiEmailFinderKeyStates.reduce((min, state) => {
+      const ms = Math.max(0, (state.cooldownUntil || 0) - Date.now());
+      return min === null || ms < min ? ms : min;
+    }, null);
+  }
+
   function soonestTruelistCooldownMs() {
     return truelistKeyStates.reduce((min, state) => {
       const ms = Math.max(0, (state.cooldownUntil || 0) - Date.now());
@@ -1997,7 +2237,7 @@ async function main() {
   }
 
   async function findCandidateEmailForRow(row) {
-    if (!rapidApiEmailFinderKey) return null;
+    if (!rapidApiEmailFinderKeyStates.length) return null;
     const name = splitNameFirstLast(row?.fullName || "");
     const domain = domainFromWebsite(row?.workEmailDomain || row?.website || "");
     if (!name || !domain) return null;
@@ -2013,34 +2253,64 @@ async function main() {
       `&personLastName=${encodeURIComponent(name.lastName)}` +
       `&domain=${encodeURIComponent(domain)}`;
 
-    try {
-      const { response, json } = await fetchJsonWithTimeout(
-        url,
-        {
-          method: "GET",
-          headers: {
-            "Content-Type": "application/json",
-            "x-rapidapi-host": "email-finder7.p.rapidapi.com",
-            "x-rapidapi-key": rapidApiEmailFinderKey,
-          },
-        },
-        emailFinderTimeoutMs
-      );
-      if (!response.ok) {
-        console.warn(
-          `[email-finder] ${response.status} for ${name.firstName} ${name.lastName} @ ${domain}`
-        );
-        return null;
+    const maxAttempts = Math.max(
+      1,
+      Math.min(rapidApiEmailFinderKeyStates.length, 3)
+    );
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      let keyState = nextAvailableRapidApiEmailFinderKeyState();
+      if (!keyState) {
+        const waitMs = soonestRapidApiEmailFinderCooldownMs();
+        if (waitMs && Number.isFinite(waitMs) && waitMs > 0) {
+          await sleep(waitMs);
+          keyState = nextAvailableRapidApiEmailFinderKeyState();
+        }
       }
-      const candidate = pickBestEmailFinderCandidate(json);
-      emailFinderCache.set(cacheKey, candidate?.address || null);
-      return candidate?.address || null;
-    } catch (error) {
-      console.warn(
-        `[email-finder] Failed for ${name.firstName} ${name.lastName} @ ${domain}: ${String(error?.message || error)}`
-      );
-      return null;
+      if (!keyState) break;
+
+      try {
+        const { response, json } = await fetchJsonWithTimeout(
+          url,
+          {
+            method: "GET",
+            headers: {
+              "Content-Type": "application/json",
+              "x-rapidapi-host": "email-finder7.p.rapidapi.com",
+              "x-rapidapi-key": keyState.token,
+            },
+          },
+          emailFinderTimeoutMs
+        );
+
+        if (response.status === 429) {
+          keyState.cooldownUntil = Date.now() + 60_000;
+          continue;
+        }
+        if (response.status === 401 || response.status === 403) {
+          keyState.cooldownUntil = Date.now() + 5 * 60_000;
+          continue;
+        }
+        if (response.status === 408 || response.status >= 500) {
+          continue;
+        }
+        if (!response.ok) {
+          console.warn(
+            `[email-finder] ${response.status} for ${name.firstName} ${name.lastName} @ ${domain}`
+          );
+          return null;
+        }
+
+        const candidate = pickBestEmailFinderCandidate(json);
+        emailFinderCache.set(cacheKey, candidate?.address || null);
+        return candidate?.address || null;
+      } catch (error) {
+        console.warn(
+          `[email-finder] Failed for ${name.firstName} ${name.lastName} @ ${domain}: ${String(error?.message || error)}`
+        );
+      }
     }
+
+    return null;
   }
 
   async function validateEmailWithTrueList(email) {
@@ -2106,7 +2376,7 @@ async function main() {
 
   async function enrichRowsWithValidatedEmails(rows, pageNum, plan) {
     if (!rows.length) return [];
-    if (!rapidApiEmailFinderKey || !truelistKeyStates.length) {
+    if (!rapidApiEmailFinderKeyStates.length || !truelistKeyStates.length) {
       console.warn(
         `[email] Missing API keys; page ${pageNum} will not save profiles because validation is required.`
       );
@@ -2176,7 +2446,10 @@ async function main() {
   }
 
   async function refreshAccountStatesFromSource(reason = "", preferredEmail = "") {
-    const freshConfig = await loadAccountsConfig({ fresh: true });
+    const freshConfig = await loadAccountsConfig({
+      fresh: true,
+      workerSlot,
+    });
     const previousCount = accountStates.length;
     const previousByEmail = new Map(
       accountStates.map((state) => [state.email.toLowerCase(), state])
@@ -2202,7 +2475,9 @@ async function main() {
     accountPassword = freshConfig.password;
 
     if (!accountStates.length) {
-      throw new Error("EMAIL_USER_LIST is empty. No accounts remain for export.");
+      throw new Error(
+        `No login accounts remain for export${workerSlot ? ` (${workerSlotDisplay(workerSlot)})` : ""}.`
+      );
     }
 
     const targetEmail = String(preferredEmail || "").trim().toLowerCase();
@@ -2221,7 +2496,7 @@ async function main() {
 
     if (accountStates.length !== previousCount) {
       console.log(
-        `[auth] Reloaded EMAIL_USER_LIST: ${previousCount} -> ${accountStates.length}${reason ? ` (${reason})` : ""}`
+        `[auth] Reloaded email pool${workerSlot ? ` (${workerSlotDisplay(workerSlot)})` : ""}: ${previousCount} -> ${accountStates.length}${reason ? ` (${reason})` : ""}`
       );
     }
     return {
@@ -2239,7 +2514,10 @@ async function main() {
       return false;
     }
 
-    const freshConfig = await loadAccountsConfig({ fresh: true });
+    const freshConfig = await loadAccountsConfig({
+      fresh: true,
+      workerSlot,
+    });
     const nextPool = freshConfig.emailPool.filter(
       (item) => String(item).trim().toLowerCase() !== normalized
     );
@@ -2247,12 +2525,15 @@ async function main() {
       return false;
     }
 
-    saveEmailPoolToConfigFile(nextPool);
+    saveEmailPoolToConfigFile(nextPool, {
+      workerSlot,
+      bindingName: accountConfigBindingName,
+    });
     console.warn(
-      `[auth] Auto-removed ${email} from EMAIL_USER_LIST${reason ? ` (${reason})` : ""}.`
+      `[auth] Auto-removed ${email} from the ${workerSlot ? workerSlotDisplay(workerSlot) : "default"} email pool${reason ? ` (${reason})` : ""}.`
     );
     console.error(
-      `[ALERT] Removeddddd blocked/dead account ${email} from EMAIL_USER_LIST${reason ? ` (${reason})` : ""}.`
+      `[ALERT] Removeddddd blocked/dead account ${email} from the ${workerSlot ? workerSlotDisplay(workerSlot) : "default"} email pool${reason ? ` (${reason})` : ""}.`
     );
     return true;
   }
@@ -2608,6 +2889,268 @@ async function main() {
     return true;
   };
 
+  const buildPlanFolderParts = (plan) =>
+    buildExportFolderParts({
+      country: plan.country,
+      role: plan.role,
+      gender: plan.gender,
+      years: plan.years,
+      totalYears: plan.totalYears,
+      employeeSize: plan.employeeSize,
+      revenueMin: plan.revenueMin,
+      revenueMax: plan.revenueMax,
+      industry: plan.industry,
+    });
+
+  const buildValidatedPageOutputPath = (task) => {
+    const planFolderParts = buildPlanFolderParts(task.plan);
+    const outDir = path.join(exportDir, ...planFolderParts);
+    fs.mkdirSync(outDir, { recursive: true });
+    return path.join(
+      outDir,
+      `contactout-page-${String(task.pageNum).padStart(4, "0")}${task.plan.exportNameSuffix}-${task.stamp}.json`
+    );
+  };
+
+  const buildRawPageOutputPath = (plan, pageNum, stamp) => {
+    const planFolderParts = buildPlanFolderParts(plan);
+    const outDir = path.join(rawExportRoot, ...planFolderParts);
+    fs.mkdirSync(outDir, { recursive: true });
+    return path.join(
+      outDir,
+      `contactout-raw-page-${String(pageNum).padStart(4, "0")}${plan.exportNameSuffix}-${stamp}.json`
+    );
+  };
+
+  const writeRawPageTask = (plan, searchId, pageNum, urlThis, rows) => {
+    const stamp = makeFileStamp();
+    const rawPath = buildRawPageOutputPath(plan, pageNum, stamp);
+    fs.writeFileSync(
+      rawPath,
+        JSON.stringify(
+          {
+            version: 1,
+            workerSlot,
+            searchId,
+            pageNum,
+            urlThis,
+          stamp,
+          plan,
+          rows,
+          scrapedAt: new Date().toISOString(),
+        },
+        null,
+        2
+      ) + "\n",
+      "utf8"
+    );
+    console.log(
+      `[contactout-bot] URL page=${pageNum} (${urlThis}): queued ${rows.length} raw row(s) -> ${rawPath}`
+    );
+    return rawPath;
+  };
+
+  const rawTaskBacklogMax = envInt(
+    "RAW_TASK_BACKLOG_MAX",
+    Math.max(4, intermediateMergeCount > 0 ? intermediateMergeCount * 2 : 12),
+    1
+  );
+  const rawTaskBacklogResumeThreshold = Math.max(
+    0,
+    Math.min(rawTaskBacklogMax - 1, Math.floor(rawTaskBacklogMax / 2))
+  );
+
+  const collectPendingRawTaskPaths = () => {
+    const out = [];
+    const visit = (dirPath) => {
+      if (!fs.existsSync(dirPath)) return;
+      for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
+        const fullPath = path.join(dirPath, entry.name);
+        if (entry.isDirectory()) {
+          visit(fullPath);
+          continue;
+        }
+        if (entry.isFile() && entry.name.startsWith("contactout-raw-page-") && entry.name.endsWith(".json")) {
+          out.push(fullPath);
+        }
+      }
+    };
+    visit(rawExportRoot);
+    out.sort();
+    return out;
+  };
+
+  const queuedRawTaskPaths = [];
+  const queuedRawTaskPathSet = new Set();
+  let rawTaskProcessorPromise = null;
+  let rawTaskProcessorError = null;
+  let activeRawTaskCount = 0;
+  let rawTaskProgressResolvers = [];
+
+  const resolveRawTaskProgressWaiters = () => {
+    const resolvers = rawTaskProgressResolvers;
+    rawTaskProgressResolvers = [];
+    for (const resolve of resolvers) {
+      resolve();
+    }
+  };
+
+  const waitForRawTaskProgress = () =>
+    new Promise((resolve) => {
+      rawTaskProgressResolvers.push(resolve);
+    });
+
+  const pendingRawTaskCount = () => queuedRawTaskPaths.length + activeRawTaskCount;
+
+  const maybeThrowRawTaskProcessorError = () => {
+    if (rawTaskProcessorError) {
+      throw rawTaskProcessorError;
+    }
+  };
+
+  const enqueueRawTaskPath = (rawPath) => {
+    if (!rawPath || queuedRawTaskPathSet.has(rawPath)) return;
+    queuedRawTaskPathSet.add(rawPath);
+    queuedRawTaskPaths.push(rawPath);
+  };
+
+  const recordValidatedRowsForMerges = (task, validatedRows) => {
+    if (!validatedRows.length) return;
+    const bucket = rowsForMergeByKey.get(task.plan.mergeKey) || [];
+    bucket.push(...validatedRows);
+    rowsForMergeByKey.set(task.plan.mergeKey, bucket);
+    if (!writeIntermediateMerges) return;
+    const mergePlan = mergePlansByKey.get(task.plan.mergeKey);
+    const middleState = rowsForIntermediateMergeByKey.get(task.plan.mergeKey) || {
+      rows: [],
+      pageFileCount: 0,
+      batchIndex: 0,
+    };
+    middleState.rows.push(...validatedRows);
+    middleState.pageFileCount += 1;
+    rowsForIntermediateMergeByKey.set(task.plan.mergeKey, middleState);
+    if (mergePlan && middleState.pageFileCount >= intermediateMergeCount) {
+      writeIntermediateMergedJson(mergePlan);
+    }
+  };
+
+  const processPendingRawTask = async (rawPath) => {
+    const task = JSON.parse(fs.readFileSync(rawPath, "utf8"));
+    const validatedRows = await enrichRowsWithValidatedEmails(
+      Array.isArray(task?.rows) ? task.rows : [],
+      task?.pageNum,
+      task?.plan
+    );
+
+    if (validatedRows.length > 0) {
+      const outPath = buildValidatedPageOutputPath(task);
+      fs.writeFileSync(
+        outPath,
+        buildJson(validatedRows, { searchRole: task?.plan?.role }),
+        "utf8"
+      );
+      console.log(
+        `[contactout-bot] Finalized page ${task.pageNum}${task?.plan?.role ? ` role=${task.plan.role}` : ""}${task?.plan?.gender ? ` gender=${task.plan.gender}` : ""}: wrote ${validatedRows.length} validated row(s) -> ${outPath}`
+      );
+      recordValidatedRowsForMerges(task, validatedRows);
+    } else {
+      console.log(
+        `[contactout-bot] Page ${task?.pageNum} produced no validated emails after deferred enrichment; JSON file not written.`
+      );
+    }
+
+    fs.unlinkSync(rawPath);
+  };
+
+  const startRawTaskProcessor = () => {
+    if (rawTaskProcessorPromise) return rawTaskProcessorPromise;
+    rawTaskProcessorPromise = (async () => {
+      try {
+        while (queuedRawTaskPaths.length > 0) {
+          const rawPath = queuedRawTaskPaths.shift();
+          if (!rawPath) continue;
+          queuedRawTaskPathSet.delete(rawPath);
+          if (!fs.existsSync(rawPath)) {
+            resolveRawTaskProgressWaiters();
+            continue;
+          }
+          activeRawTaskCount += 1;
+          try {
+            await processPendingRawTask(rawPath);
+          } finally {
+            activeRawTaskCount = Math.max(0, activeRawTaskCount - 1);
+            resolveRawTaskProgressWaiters();
+          }
+        }
+      } catch (error) {
+        rawTaskProcessorError = error;
+        resolveRawTaskProgressWaiters();
+      } finally {
+        rawTaskProcessorPromise = null;
+      }
+    })();
+    return rawTaskProcessorPromise;
+  };
+
+  const queuePendingRawTasksFromDisk = () => {
+    const pendingRawTasks = collectPendingRawTaskPaths();
+    for (const rawPath of pendingRawTasks) {
+      enqueueRawTaskPath(rawPath);
+    }
+    return pendingRawTasks.length;
+  };
+
+  const kickRawTaskProcessor = () => {
+    maybeThrowRawTaskProcessorError();
+    if (pendingRawTaskCount() === 0) return;
+    startRawTaskProcessor();
+  };
+
+  const maybeApplyRawTaskBackpressure = async (reason = "") => {
+    maybeThrowRawTaskProcessorError();
+    if (pendingRawTaskCount() < rawTaskBacklogMax) return;
+    console.log(
+      `[contactout-bot] Raw validation backlog reached ${pendingRawTaskCount()} task(s)${reason ? ` (${reason})` : ""}; waiting for it to drain below ${rawTaskBacklogResumeThreshold || 0}.`
+    );
+    kickRawTaskProcessor();
+    while (pendingRawTaskCount() > rawTaskBacklogResumeThreshold) {
+      await waitForRawTaskProgress();
+      maybeThrowRawTaskProcessorError();
+      if (!rawTaskProcessorPromise && pendingRawTaskCount() > 0) {
+        kickRawTaskProcessor();
+      }
+    }
+  };
+
+  const drainPendingRawTasks = async () => {
+    maybeThrowRawTaskProcessorError();
+    while (true) {
+      if (!rawTaskProcessorPromise && pendingRawTaskCount() === 0) {
+        break;
+      }
+      kickRawTaskProcessor();
+      if (rawTaskProcessorPromise) {
+        await rawTaskProcessorPromise;
+      } else {
+        await waitForRawTaskProgress();
+      }
+      maybeThrowRawTaskProcessorError();
+      if (!rawTaskProcessorPromise && pendingRawTaskCount() === 0) {
+        break;
+      }
+    }
+  };
+
+  const primePendingRawTasks = () => {
+    const pendingRawTaskCountOnDisk = queuePendingRawTasksFromDisk();
+    if (pendingRawTaskCountOnDisk > 0) {
+      console.log(
+        `[contactout-bot] Resuming ${pendingRawTaskCountOnDisk} deferred raw page task(s)${workerSlot ? ` for ${workerSlotDisplay(workerSlot)}` : ""}.`
+      );
+      kickRawTaskProcessor();
+    }
+  };
+
   const runSearchPlan = async (plan) => {
     const searchBaseUrl = normalizeSearchBaseUrl(plan.searchUrlRaw);
     const searchId = searchIdFromBaseUrl(searchBaseUrl);
@@ -2892,22 +3435,6 @@ async function main() {
 
     let lastPaginationFingerprint = "";
 
-    const exportPageToJson = (pageNum, urlThis, rows) => {
-      const json = buildJson(rows, { searchRole: plan.role });
-      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
-      const outDir = path.join(exportDir, ...exportFolderParts);
-      fs.mkdirSync(outDir, { recursive: true });
-      const outPath = path.join(
-        outDir,
-        `contactout-page-${String(pageNum).padStart(4, "0")}${exportNameSuffix}-${stamp}.json`
-      );
-      fs.writeFileSync(outPath, json, "utf8");
-      console.log(
-        `[contactout-bot] URL page=${pageNum} (${urlThis}): wrote ${rows.length} row(s) -> ${outPath}`
-      );
-      return outPath;
-    };
-
     const processPage = async (pageNum) => {
       const urlThis = buildSearchUrlWithPage(searchBaseUrl, pageNum);
       if (!ignoreSearchHistory && isPageCompleted(history, searchId, pageNum)) {
@@ -2967,48 +3494,20 @@ async function main() {
         }
         lastPaginationFingerprint = fp;
 
-        const validatedRows = await enrichRowsWithValidatedEmails(
-          rows,
-          pageNum,
-          plan
-        );
-
-        if (validatedRows.length > 0) {
-          exportPageToJson(pageNum, urlThis, validatedRows);
-          const bucket = rowsForMergeByKey.get(plan.mergeKey) || [];
-          bucket.push(...validatedRows);
-          rowsForMergeByKey.set(plan.mergeKey, bucket);
-          if (writeIntermediateMerges) {
-            const mergePlan = mergePlansByKey.get(plan.mergeKey);
-            const middleState = rowsForIntermediateMergeByKey.get(plan.mergeKey) || {
-              rows: [],
-              pageFileCount: 0,
-              batchIndex: 0,
-            };
-            middleState.rows.push(...validatedRows);
-            middleState.pageFileCount += 1;
-            rowsForIntermediateMergeByKey.set(plan.mergeKey, middleState);
-            if (mergePlan && middleState.pageFileCount >= intermediateMergeCount) {
-              writeIntermediateMergedJson(mergePlan);
-            }
-          }
-        } else {
-          console.log(
-            `[contactout-bot] Page ${pageNum} produced no validated emails; JSON file not written.`
-          );
-        }
+        const rawTaskPath = writeRawPageTask(plan, searchId, pageNum, urlThis, rows);
+        enqueueRawTaskPath(rawTaskPath);
+        kickRawTaskProcessor();
         if (!ignoreSearchHistory) {
           markPageCompleted(history, searchId, searchBaseUrl, pageNum);
           saveSearchHistory(historyPath, history);
         }
-        if (validatedRows.length > 0) {
-          await noteSuccessfulPageExport(
-            `page ${pageNum}${plan.role ? ` role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}`
-          );
-        } else {
-          await sleepRandom(pageGapDelayMinMs, pageGapDelayMaxMs);
-        }
-        return { empty: false, rows: validatedRows };
+        await maybeApplyRawTaskBackpressure(
+          `page ${pageNum}${plan.role ? ` role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}`
+        );
+        await noteSuccessfulPageExport(
+          `page ${pageNum}${plan.role ? ` role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}`
+        );
+        return { empty: false, rows };
       }
       return { empty: true, rows: [] };
     };
@@ -3045,9 +3544,13 @@ async function main() {
   };
 
   try {
+    primePendingRawTasks();
+
     for (const plan of searchPlans) {
       await runSearchPlan(plan);
     }
+
+    await drainPendingRawTasks();
 
     if (writeIntermediateMerges) {
       for (const mergePlan of mergePlans) {
@@ -3084,175 +3587,6 @@ async function main() {
     }
     return;
 
-    const firstUrl = buildSearchUrlWithPage(searchBaseUrl, startPage);
-    await gotoWith429Retry(firstUrl, "first search page");
-
-    if (pathnameLooksLikeLogin(page.url())) {
-      console.log("[contactout-bot] Not logged in; signing in…");
-      await login(page, currentEmail(), accountPassword);
-      await gotoWith429Retry(firstUrl, "after login");
-    } else {
-      console.log("[contactout-bot] Already logged in; continuing with search.");
-    }
-
-    if (rotator) await persistSession();
-
-    if (!urlHasLocationParam(searchBaseUrl)) {
-      await setLocationUnitedStates(page, location);
-      if (rotator) await persistSession();
-    }
-
-    const gotoSearchPage = async (pageNum) => {
-      const urlThis = buildSearchUrlWithPage(searchBaseUrl, pageNum);
-      await gotoWith429Retry(urlThis, `result page=${pageNum}`);
-      if (pathnameLooksLikeLogin(page.url())) {
-        console.log(
-          "[contactout-bot] On login page (e.g. after 429 session reset); signing in again…"
-        );
-        await login(page, currentEmail(), accountPassword);
-        await gotoWith429Retry(urlThis, `after re-login page=${pageNum}`);
-        if (rotator) await persistSession();
-      }
-    };
-
-    let lastPaginationFingerprint = "";
-
-    const exportPageToJson = (pageNum, urlThis, rows) => {
-      const json = buildJson(rows);
-      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
-      const outPath = path.join(
-        exportDir,
-        `contactout-page-${String(pageNum).padStart(4, "0")}${exportNameSuffix}-${stamp}.json`
-      );
-      fs.writeFileSync(outPath, json, "utf8");
-      console.log(
-        `[contactout-bot] URL page=${pageNum} (${urlThis}): wrote ${rows.length} row(s) -> ${outPath}`
-      );
-      return outPath;
-    };
-
-    const processPage = async (pageNum) => {
-      const urlThis = buildSearchUrlWithPage(searchBaseUrl, pageNum);
-      if (!ignoreSearchHistory && isPageCompleted(history, searchId, pageNum)) {
-        console.log(
-          `[contactout-bot] Skip page ${pageNum} (already in search history: ${path.basename(historyPath)}).`
-        );
-        return;
-      }
-      for (let attempt = 0; attempt <= emptyPageRetryMax; attempt++) {
-        await gotoSearchPage(pageNum);
-        await sleep(2_000);
-
-        const rows = await scrapeCurrentPageRows(page);
-        if (rows.length === 0) {
-          const pageState = await inspectSearchPageState(page);
-          const looksLikeLogin =
-            pathnameLooksLikeLogin(page.url()) || pageState.hasPasswordInput;
-          const suspiciousEmpty = pageState.blocked || looksLikeLogin || !pageState.noResults;
-
-          if (suspiciousEmpty && attempt < emptyPageRetryMax) {
-            console.warn(
-              `[contactout-bot] Page ${pageNum} returned 0 rows but looks blocked/incomplete; retry ${attempt + 1}/${emptyPageRetryMax}.`
-            );
-            if (rotator) {
-              await recreateProxyContext(
-                pageState.blocked || looksLikeLogin
-                  ? "blocked/empty result page"
-                  : "empty/incomplete result page",
-                { clearSession: pageState.blocked || looksLikeLogin }
-              );
-            } else {
-              await sleep(backoff429);
-            }
-            continue;
-          }
-
-          return { empty: true, rows };
-        }
-
-        const fp = paginationFingerprint(rows);
-        if (
-          envStopOnDuplicatePagination() &&
-          lastPaginationFingerprint &&
-          fp === lastPaginationFingerprint
-        ) {
-          console.warn(
-            `[contactout-bot] Page ${pageNum} is identical to the previous page (pagination stuck). ` +
-              `Not writing JSON. Update SEARCH_COUNTRY_LIST, CONTACTOUT_LOCATION, SEARCH_PROFILE / --random-search (search_keywords.json), or CONTACTOUT_SEARCH_URL / filters for a new slice of results, then re-run (or set STOP_ON_DUPLICATE_PAGE=0 to ignore).`
-          );
-          return { duplicate: true, rows };
-        }
-        lastPaginationFingerprint = fp;
-
-        exportPageToJson(pageNum, urlThis, rows);
-        rowsForMerge.push(...rows);
-        if (!ignoreSearchHistory) {
-          markPageCompleted(history, searchId, searchBaseUrl, pageNum);
-          saveSearchHistory(historyPath, history);
-        }
-        if (
-          rotator &&
-          rotator.multi &&
-          rotator.rotateEvery > 0
-        ) {
-          pagesSinceRotate += 1;
-          if (pagesSinceRotate >= rotator.rotateEvery) {
-            pagesSinceRotate = 0;
-            await persistSession();
-            await recreateProxyContext(
-              `PROXY_ROTATE_EVERY=${rotator.rotateEvery} pages`
-            );
-          }
-        }
-        return { empty: false, rows };
-      }
-      return { empty: true, rows: [] };
-    };
-
-    if (unlimitedPages) {
-      for (let pageNum = startPage; ; pageNum++) {
-        const res = await processPage(pageNum);
-        if (res == null) continue;
-        if (res.empty) {
-          console.log(
-            `[contactout-bot] No rows on URL page=${pageNum}; stopping (MAX_PAGES=0).`
-          );
-          break;
-        }
-        if (res.duplicate) break;
-      }
-    } else {
-      for (let i = 0; i < maxPages; i++) {
-        const pageNum = startPage + i;
-        const res = await processPage(pageNum);
-        if (res == null) continue;
-        if (res.empty) {
-          console.log(
-            `[contactout-bot] No rows on URL page=${pageNum}; stopping.`
-          );
-          break;
-        }
-        if (res.duplicate) break;
-      }
-      console.log(`[contactout-bot] Finished page range (MAX_PAGES=${maxPages}).`);
-    }
-
-    if (mergeJson && rowsForMerge.length > 0) {
-      const merged = dedupeRowsByLinkedin(rowsForMerge);
-      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
-      const mergedPath = path.join(
-        mergedDir,
-        `contactout-merged-${searchId.slice(0, 8)}${exportNameSuffix}-items-${merged.length}-${stamp}.json`
-      );
-      fs.writeFileSync(mergedPath, buildJson(merged), "utf8");
-      console.log(
-        `[contactout-bot] Merged ${rowsForMerge.length} row(s) from this run → ${merged.length} unique → ${mergedPath}`
-      );
-    } else if (mergeJson) {
-      console.log(
-        "[contactout-bot] No new rows this run; merged JSON not written."
-      );
-    }
   } finally {
     if (rotator) {
       await persistSession().catch(() => {});

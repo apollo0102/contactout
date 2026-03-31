@@ -1,7 +1,7 @@
 // CONTACTOUT_PASSWORD=Glo123456!
 const SEARCH_COUNTRY_LIST = ["United States"]
 
-const SEARCH_ROLE_LIST = ["Engineering Manager", "Project Manager", "Operations Manager", "Sales Manager", "Marketing Manager", "Finance Manager", "Accounting Manager", "HR Manager", "Customer Success Manager", "Business Development Manager", "IT Manager", "Compliance Manager"]
+const SEARCH_ROLE_LIST = ["Project Manager", "Operations Manager", "Sales Manager", "Marketing Manager", "Finance Manager", "Accounting Manager", "HR Manager", "Customer Success Manager", "Business Development Manager", "IT Manager", "Compliance Manager"]
 
 //First priority in search
 const SEARCH_GENDER_LIST = ["Male", "Female", "Unknown"]
@@ -12,7 +12,7 @@ const SEARCH_YEARS = [0,1,2,3,4,5]
 
 //Third priority in search
 //Total years of experience // 0_1: less than 1 year, 1_2: 1-2 years, 3_5: 3-5 years, 6_10: 6-10 years, 10_9999: more than 10 years
-const SEARCH_TOTALYEARS = ["0_1", "1_2", "3_5", "6_10", "10_9999"]
+const SEARCH_TOTALYEARS = ["0_1", "1_2", "3-5", "6_10", "10_9999"]
 
 //Fourth priority in search
 //employee_size // 1-10: 1_10, 11-50: 11_50, 51-200:51_200, 201-500: 201_500, 501-1000: 501_1000, 1001-5000: 1001_5000, 5001-10000: 5001_10000, 10000+: 10001
@@ -209,6 +209,7 @@ const PROXY_VALIDATE_CONCURRENCY = 5;
 const JSON_MERGE_COUNT = 10
 const MERGED_DIRECTORY="./data/merged"
 const RAPID_API_EMAIL_FINDER="59620721c8msh68873a42a2df9cfp193314jsnd519123e0bfc"
+const RAPID_API_EMAIL_FINDER_LIST=["59620721c8msh68873a42a2df9cfp193314jsnd519123e0bfc", "59620721c8msh68873a42a2df9cfp193314jsnd519123e0bfc"]
 const TRUELIST_API_KEYS=[
     "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6ImEwMmEyMzA5LTIzNzktNDMzYy05NmU4LTI3OWMzMTVlNjI1ZSIsImV4cGlyZXNfYXQiOm51bGx9.aol07hKqYXicOlTYOzJ0Jgn9dNSSftM6C6ADG16sFT4",
     "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6ImQ3N2JhYzJmLWVjMTEtNDY4MS05Y2VlLTVlNjdjMDc0MWJiZiIsImV4cGlyZXNfYXQiOm51bGx9.ZwbkXT5SSeHS3vfSyPpGfK7edLTeVZpbo3td-8cElq4",
@@ -236,6 +237,8 @@ const BANNED_WEBSITE_DOMAIN=
 "dispostable.com", "fakemail.net", "inboxkitten.com", "minutemail.com"
 ]
 
+const MAX_BROWSER_COUNT=3
+
 export default {
     SEARCH_COUNTRY_LIST,
     SEARCH_ROLE_LIST,
@@ -259,5 +262,7 @@ export default {
     MERGED_DIRECTORY,
     RAPID_API_EMAIL_FINDER,
     TRUELIST_API_KEYS,
-    BANNED_WEBSITE_DOMAIN
+    BANNED_WEBSITE_DOMAIN,
+    MAX_BROWSER_COUNT,
+    RAPID_API_EMAIL_FINDER_LIST
 };

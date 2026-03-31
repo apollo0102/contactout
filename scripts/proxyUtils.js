@@ -3,11 +3,17 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { request as apiRequest } from "playwright";
+import {
+  LEGACY_PROXIES_FILE_PATH,
+  loadProxyConfig,
+  normalizeWorkerGender,
+  normalizeWorkerSlot,
+} from "./workerConfig.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
 const CONSTANTS_CONFIG_PATH = path.join(ROOT, "ref", "constants.js");
-const DEFAULT_PROXY_FILE = path.join(ROOT, "ref", "proxies.txt");
+const DEFAULT_PROXY_FILE = LEGACY_PROXIES_FILE_PATH;
 
 function isEnvFalseLike(value) {
   const normalized = String(value ?? "").trim().toLowerCase();
@@ -111,7 +117,7 @@ function dedupePreserveOrder(items) {
   return out;
 }
 
-function collectProxyLinesFromConfiguredSources(rootDir, constants) {
+async function collectProxyLinesFromConfiguredSources(rootDir, constants) {
   const outputPath = resolveProxyFilePath(rootDir, constants);
   const sources = [];
   const lines = [];
@@ -125,6 +131,20 @@ function collectProxyLinesFromConfiguredSources(rootDir, constants) {
 
   if (fs.existsSync(outputPath)) {
     pushBlock(outputPath, fs.readFileSync(outputPath, "utf8"));
+  }
+
+  const workerGender = normalizeWorkerGender(process.env.CONTACTOUT_WORKER_GENDER);
+  const workerSlot = normalizeWorkerSlot(process.env.CONTACTOUT_WORKER_SLOT);
+  const proxyConfig = await loadProxyConfig({
+    fresh: true,
+    workerSlot,
+    workerGender,
+  });
+  if (proxyConfig.proxyLines.length) {
+    pushBlock(
+      `${proxyConfig.source}${workerGender ? `#${workerGender}` : ""}`,
+      JSON.stringify(proxyConfig.proxyLines)
+    );
   }
 
   const proxiesEnv = process.env.PROXIES?.trim();
@@ -312,7 +332,7 @@ export async function refreshProxyFileFromLocalList(options = {}) {
   const constants = options.constants || (await loadConstantsConfig());
   const rootDir = options.rootDir || ROOT;
   const logger = options.logger || console;
-  const configured = collectProxyLinesFromConfiguredSources(rootDir, constants);
+  const configured = await collectProxyLinesFromConfiguredSources(rootDir, constants);
   const outputPath = options.outputPath || configured.outputPath;
   const lines = configured.lines;
 
