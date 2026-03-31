@@ -584,9 +584,14 @@ function parseEmailPoolFromEnv() {
   return [];
 }
 
-async function loadAccountsConfig() {
+async function loadAccountsConfig(options = {}) {
+  const fresh = Boolean(options.fresh);
   if (fs.existsSync(EMAILS_CONFIG_PATH)) {
-    const mod = await import(pathToFileURL(EMAILS_CONFIG_PATH).href);
+    const configUrl = pathToFileURL(EMAILS_CONFIG_PATH);
+    if (fresh) {
+      configUrl.searchParams.set("t", String(Date.now()));
+    }
+    const mod = await import(configUrl.href);
     const emailPool = Array.isArray(mod.EMAIL_USER_LIST)
       ? [...new Set(mod.EMAIL_USER_LIST.map((s) => String(s).trim()).filter(Boolean))]
       : [];
@@ -620,6 +625,23 @@ async function loadAccountsConfig() {
     );
   }
   return { emailPool, password, source: "environment variables" };
+}
+
+function formatEmailUserListSource(emailPool) {
+  if (!emailPool.length) return "[]";
+  return `[\n${emailPool.map((email) => `    ${JSON.stringify(String(email).trim())}`).join(",\n")}\n]`;
+}
+
+function saveEmailPoolToConfigFile(emailPool) {
+  const raw = fs.readFileSync(EMAILS_CONFIG_PATH, "utf8");
+  const next = raw.replace(
+    /^export const EMAIL_USER_LIST\s*=\s*\[(.*?)\];/ms,
+    `export const EMAIL_USER_LIST = ${formatEmailUserListSource(emailPool)};`
+  );
+  if (next === raw) {
+    throw new Error(`Could not update EMAIL_USER_LIST in ${EMAILS_CONFIG_PATH}`);
+  }
+  fs.writeFileSync(EMAILS_CONFIG_PATH, next, "utf8");
 }
 
 function sleep(ms) {
@@ -1788,7 +1810,9 @@ async function main() {
 
   const accountConfig = await loadAccountsConfig();
   const emailPool = accountConfig.emailPool;
-  const accountPassword = accountConfig.password;
+  let accountPassword = accountConfig.password;
+  const accountConfigSource = accountConfig.source;
+  const canEditAccountConfig = accountConfigSource === EMAILS_CONFIG_PATH;
   const accountRotateSuccessPages = envInt(
     "ACCOUNT_ROTATE_SUCCESS_PAGES",
     20,
@@ -1813,7 +1837,7 @@ async function main() {
     0
   );
   console.log(`[auth] Loaded accounts from ${accountConfig.source}`);
-  const accountStates = emailPool.map((email, index) => ({
+  let accountStates = emailPool.map((email, index) => ({
     index,
     email,
     activatedAt: 0,
@@ -1822,7 +1846,15 @@ async function main() {
   }));
   let activeAccountIndex = 0;
   let successfulPagesOnCurrentAccount = 0;
-  const currentAccount = () => accountStates[activeAccountIndex % accountStates.length];
+  const currentAccount = () => {
+    if (!accountStates.length) {
+      throw new Error("No active accounts remain in EMAIL_USER_LIST.");
+    }
+    const safeIndex =
+      ((activeAccountIndex % accountStates.length) + accountStates.length) %
+      accountStates.length;
+    return accountStates[safeIndex];
+  };
   const currentEmail = () => currentAccount().email;
   console.log(
     `[auth] ${emailPool.length} account(s); rotate after ${accountRotateSuccessPages} successful pages, cooldown ${Math.round(accountCooldownMs / 60000)} minute(s)`
@@ -2114,6 +2146,88 @@ async function main() {
     return v !== "0" && v !== "false" && v !== "no";
   }
 
+  async function refreshAccountStatesFromSource(reason = "", preferredEmail = "") {
+    const freshConfig = await loadAccountsConfig({ fresh: true });
+    const previousCount = accountStates.length;
+    const previousByEmail = new Map(
+      accountStates.map((state) => [state.email.toLowerCase(), state])
+    );
+    const nextStates = freshConfig.emailPool.map((email, index) => {
+      const existing = previousByEmail.get(String(email).toLowerCase());
+      if (existing) {
+        return {
+          ...existing,
+          index,
+          email,
+        };
+      }
+      return {
+        index,
+        email,
+        activatedAt: 0,
+        cooldownUntil: 0,
+        successfulPages: 0,
+      };
+    });
+    accountStates = nextStates;
+    accountPassword = freshConfig.password;
+
+    if (!accountStates.length) {
+      throw new Error("EMAIL_USER_LIST is empty. No accounts remain for export.");
+    }
+
+    const targetEmail = String(preferredEmail || "").trim().toLowerCase();
+    const preferredIndex = targetEmail
+      ? accountStates.findIndex(
+          (state) => state.email.toLowerCase() === targetEmail
+        )
+      : -1;
+    if (preferredIndex >= 0) {
+      activeAccountIndex = preferredIndex;
+    } else if (targetEmail) {
+      activeAccountIndex = -1;
+    } else if (activeAccountIndex >= accountStates.length) {
+      activeAccountIndex = accountStates.length - 1;
+    }
+
+    if (accountStates.length !== previousCount) {
+      console.log(
+        `[auth] Reloaded EMAIL_USER_LIST: ${previousCount} -> ${accountStates.length}${reason ? ` (${reason})` : ""}`
+      );
+    }
+    return {
+      preferredFound: preferredIndex >= 0,
+    };
+  }
+
+  async function removeEmailFromAccountSource(email, reason = "") {
+    const normalized = String(email || "").trim().toLowerCase();
+    if (!normalized) return false;
+    if (!canEditAccountConfig) {
+      console.warn(
+        `[auth] Cannot auto-remove ${email}; accounts are not sourced from ${EMAILS_CONFIG_PATH}.`
+      );
+      return false;
+    }
+
+    const freshConfig = await loadAccountsConfig({ fresh: true });
+    const nextPool = freshConfig.emailPool.filter(
+      (item) => String(item).trim().toLowerCase() !== normalized
+    );
+    if (nextPool.length === freshConfig.emailPool.length) {
+      return false;
+    }
+
+    saveEmailPoolToConfigFile(nextPool);
+    console.warn(
+      `[auth] Auto-removed ${email} from EMAIL_USER_LIST${reason ? ` (${reason})` : ""}.`
+    );
+    console.error(
+      `[ALERT] Removeddddd blocked/dead account ${email} from EMAIL_USER_LIST${reason ? ` (${reason})` : ""}.`
+    );
+    return true;
+  }
+
   function activateAccount(index, reason = "startup") {
     activeAccountIndex =
       ((index % accountStates.length) + accountStates.length) %
@@ -2140,6 +2254,7 @@ async function main() {
   }
 
   function nextAvailableAccountIndex() {
+    if (!accountStates.length) return -1;
     const now = Date.now();
     for (let offset = 1; offset <= accountStates.length; offset++) {
       const index = (activeAccountIndex + offset) % accountStates.length;
@@ -2236,12 +2351,34 @@ async function main() {
   async function rotateAccountProxyPair(reason, options = {}) {
     const penalizeCurrentProxyMs = Math.max(0, options.penalizeCurrentProxyMs || 0);
     const clearSession = options.clearSession !== false;
+    const removeCurrentAccount = Boolean(options.removeCurrentAccount);
+    const activeEmailBeforeRotation =
+      accountStates.length > 0 ? currentAccount().email : "";
 
     if (rotator && penalizeCurrentProxyMs > 0) {
       rotator.markCooldown(penalizeCurrentProxyMs, reason);
     }
 
-    markCurrentAccountCoolingDown(reason);
+    if (removeCurrentAccount && activeEmailBeforeRotation) {
+      await removeEmailFromAccountSource(activeEmailBeforeRotation, reason);
+      activeAccountIndex = -1;
+      await refreshAccountStatesFromSource(
+        `after removing ${activeEmailBeforeRotation}`,
+        ""
+      );
+    } else {
+      const refreshResult = await refreshAccountStatesFromSource(
+        `before rotation: ${reason}`,
+        activeEmailBeforeRotation
+      );
+      if (refreshResult?.preferredFound) {
+        markCurrentAccountCoolingDown(reason);
+      } else if (activeEmailBeforeRotation) {
+        console.log(
+          `[auth] Skipping cooldown for removed account ${activeEmailBeforeRotation} (${reason}).`
+        );
+      }
+    }
 
     let nextIndex = nextAvailableAccountIndex();
     if (nextIndex < 0) {
@@ -2385,6 +2522,7 @@ async function main() {
         await rotateAccountProxyPair(statusLabel, {
           clearSession: true,
           penalizeCurrentProxyMs: proxyBlockedCooldownMs,
+          removeCurrentAccount: true,
         });
         continue;
       }
@@ -2517,6 +2655,7 @@ async function main() {
             await rotateAccountProxyPair("blocked first search page", {
               clearSession: true,
               penalizeCurrentProxyMs: proxyBlockedCooldownMs,
+              removeCurrentAccount: true,
             });
           } else if (suspicious) {
             rotator?.markCooldown(proxyFailureCooldownMs, "incomplete first search page");
@@ -2765,6 +2904,7 @@ async function main() {
               await rotateAccountProxyPair("blocked/empty result page", {
                 clearSession: true,
                 penalizeCurrentProxyMs: proxyBlockedCooldownMs,
+                removeCurrentAccount: true,
               });
             } else {
               rotator?.markCooldown(proxyFailureCooldownMs, "empty/incomplete result page");
