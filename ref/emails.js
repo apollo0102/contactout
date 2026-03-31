@@ -8,20 +8,10 @@
 
 
 export const EMAIL_USER_LIST = [
-    "kileyheadley@outlook.com",
-    "maryjothom@outlook.com",
-    "FlaviaGabriella1997@outlook.com",
-    "Vivionne1@outlook.com",
-    "KylerJohnson1964@outlook.com",
     "MichaelMDavis1924@outlook.com",
     "RichardMBooker@outlook.com",
-    "StephenSBallweg@outlook.com",
-    "MauriceJPalmer@outlook.com",
-    "JamiePLaub@outlook.com",
-    "HelenHames1980@outlook.com",
     "shannon12152026@outlook.com",
     "myenchanted220@outlook.com",
-    "regan-schwartz-3b21b2186@outlook.com",
     "julie-spillane-43b7a8157@outlook.com",
     "kristi-hadley-a872b654@outlook.com",
     "armando-gaytan-0b8502101@outlook.com",

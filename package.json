@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "export": "node scripts/contactout-export-bot.mjs"
+    "export": "node scripts/contactout-export-bot.mjs",
+    "proxies:refresh": "node scripts/proxyUtils.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

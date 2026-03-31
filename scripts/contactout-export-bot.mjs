@@ -77,6 +77,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { chromium, request as apiRequest } from "playwright";
 import ProxyChain from "proxy-chain";
+import { maybeRefreshProxyFileFromLocalList } from "./proxyUtils.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -846,9 +847,17 @@ function createProxyRotator() {
       );
       this.failureCountByIndex[index] =
         (this.failureCountByIndex[index] || 0) + 1;
+      const strikes = this.failureCountByIndex[index];
       if (waitMs > 0) {
         console.warn(
+          `[proxy] Mark bad ${this.peekLabel(index)}: strikes=${strikes}; cooldown ${formatDuration(waitMs)}${reason ? ` (${reason})` : ""}`
+        );
+        console.warn(
           `[proxy] Cooldown ${this.peekLabel(index)} for ${formatDuration(waitMs)}${reason ? ` (${reason})` : ""}`
+        );
+      } else if (reason) {
+        console.warn(
+          `[proxy] Mark bad ${this.peekLabel(index)}: strikes=${strikes}${reason ? ` (${reason})` : ""}`
         );
       }
     },
@@ -1764,6 +1773,19 @@ async function setLocationUnitedStates(page, locationLabel) {
 
 async function main() {
   await loadConstantsConfigToEnv();
+  try {
+    const proxyRefreshResult = await maybeRefreshProxyFileFromLocalList({
+      rootDir: ROOT,
+      logger: console,
+    });
+    if (proxyRefreshResult?.skipped) {
+      console.log(`[proxy] Proxy preflight skipped: ${proxyRefreshResult.reason}`);
+    }
+  } catch (error) {
+    console.warn(
+      `[proxy] Proxy preflight failed; using existing proxy sources. ${error?.message || error}`
+    );
+  }
   loadScrapeDomEval();
 
   const cli = parseCliArgs(process.argv.slice(2));
@@ -1878,6 +1900,13 @@ async function main() {
   const currentProxyLabel = () => (rotator ? rotator.peekLabel() : "direct");
   const currentSessionLabel = () =>
     `email=${currentEmail()} proxy=${currentProxyLabel()}`;
+  const logBadProxyRuntime = (reason, details = "") => {
+    if (!rotator) return;
+    const suffix = details ? ` | ${details}` : "";
+    console.warn(
+      `[proxy] Bad runtime status: ${currentProxyLabel()} | ${reason} | ${currentSessionLabel()}${suffix}`
+    );
+  };
   const storageStatePath = path.join(userDataDir, "storage-state.json");
   fs.mkdirSync(userDataDir, { recursive: true });
   const backoff429 =
@@ -2492,6 +2521,7 @@ async function main() {
             failoversForThisNav += 1;
             const oneLine = String(e.message || e).split("\n")[0].slice(0, 140);
             const reason = navTimeout && !tunnelFail ? "navigation timeout" : "dead or blocked proxy";
+            logBadProxyRuntime(reason, `${label}; ${oneLine}`);
             console.warn(
               `[proxy] ${label}: ${oneLine} — ${reason}, failover ${failoversForThisNav}/${proxyFailoverCap}`
             );
@@ -2513,6 +2543,7 @@ async function main() {
       if (isBlockedHttpStatus(st)) {
         blockedStatuses.push(st);
         const statusLabel = blockedStatusLabel(st);
+        logBadProxyRuntime(statusLabel, `${label}; round ${round + 1}/${maxBlocked}`);
         console.warn(
           `[contactout-bot] ${statusLabel} on ${label} (round ${round + 1}/${maxBlocked}) - rotate session/proxy before retry`
         );
