@@ -210,6 +210,16 @@ function proxyHealthCheckUrl(constants) {
   );
 }
 
+function isRateLimitedHealthProbe(url, status) {
+  if (status !== 403 && status !== 429) return false;
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === "contactout.com" || host.endsWith(".contactout.com");
+  } catch {
+    return false;
+  }
+}
+
 function proxyHealthTimeoutMs(constants) {
   return coalesceIntegerSetting(
     "PROXY_HEALTH_TIMEOUT_MS",
@@ -238,12 +248,16 @@ async function validateProxyLine(proxyLine, options = {}) {
       ignoreHTTPSErrors: proxyHealthIgnoreTls(constants),
     });
     const response = await ctx.get(url, { timeout });
+    const blockedByTarget = isRateLimitedHealthProbe(url, response.status());
     return {
       proxyLine,
-      ok: response.ok(),
+      ok: response.ok() || blockedByTarget,
       status: response.status(),
       elapsedMs: Date.now() - startedAt,
-      error: response.ok() ? "" : `HTTP ${response.status()}`,
+      error:
+        response.ok() || blockedByTarget
+          ? ""
+          : `HTTP ${response.status()}`,
     };
   } catch (error) {
     return {

@@ -69,6 +69,9 @@
  *   PROXY_HEALTH_CHECK_URL — default https://www.google.com/generate_204
  *   PROXY_HEALTH_TIMEOUT_MS — default 15000
  *   PROXY_HEALTH_MAX_TRIES — max proxies to try when finding a live one (default min(200, list size))
+ *   PROXY_EXHAUSTED_RETRY_MS — when no healthy proxy is currently available, wait this long
+ *     before retrying if no proxy cooldown is known (default 60000)
+ *   PROXY_EXHAUSTED_MAX_WAIT_MS — optional total cap for waiting on proxy recovery; 0 = wait forever
  */
 import "dotenv/config";
 import crypto from "node:crypto";
@@ -969,6 +972,16 @@ function proxyHealthCheckUrl() {
   return u || "https://www.google.com/generate_204";
 }
 
+function isRateLimitedHealthProbe(url, status) {
+  if (status !== 403 && status !== 429) return false;
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === "contactout.com" || host.endsWith(".contactout.com");
+  } catch {
+    return false;
+  }
+}
+
 function proxyHealthMaxSkips(rotator) {
   const raw = process.env.PROXY_HEALTH_MAX_TRIES;
   let cap =
@@ -977,6 +990,14 @@ function proxyHealthMaxSkips(rotator) {
       : Math.min(200, rotator.servers.length);
   if (!Number.isFinite(cap) || cap < 1) cap = Math.min(200, rotator.servers.length);
   return Math.min(rotator.servers.length, cap);
+}
+
+function proxyExhaustedRetryMs() {
+  return envInt("PROXY_EXHAUSTED_RETRY_MS", 60_000, 1_000);
+}
+
+function proxyExhaustedMaxWaitMs() {
+  return envInt("PROXY_EXHAUSTED_MAX_WAIT_MS", 0, 0);
 }
 
 /**
@@ -1000,6 +1021,12 @@ async function proxyPassesHealthCheck(playwrightProxy) {
         process.env.PROXY_HEALTH_IGNORE_TLS === "true",
     });
     const res = await ctx.get(url, { timeout });
+    if (isRateLimitedHealthProbe(url, res.status())) {
+      console.warn(
+        `[proxy] Health probe ${url} returned HTTP ${res.status()}; treating proxy as reachable because the target is rate-limiting, not necessarily unreachable.`
+      );
+      return true;
+    }
     return res.ok();
   } catch {
     return false;
@@ -1031,6 +1058,8 @@ async function skipUntilHealthyProxy(rotator, tag) {
     }
 
     if (healthCheckDisabled || (await proxyPassesHealthCheck(p))) {
+      rotator.exhaustedStartedAt = 0;
+      rotator.exhaustedWaitCount = 0;
       if (skipped > 0) {
         console.log(
           `[proxy] Reachable after ${skipped} dead (${tag}) → ${label}`
@@ -1052,17 +1081,38 @@ async function skipUntilHealthyProxy(rotator, tag) {
   }
 
   const shortestCooldownMs = rotator.shortestCooldownMs?.() || 0;
+  const exhaustedRetryMs = proxyExhaustedRetryMs();
+  const exhaustedMaxWaitMs = proxyExhaustedMaxWaitMs();
+  const waitMs =
+    shortestCooldownMs > 0 && Number.isFinite(shortestCooldownMs)
+      ? shortestCooldownMs
+      : exhaustedRetryMs;
+  const exhaustedStartedAt = rotator.exhaustedStartedAt || Date.now();
+  rotator.exhaustedStartedAt = exhaustedStartedAt;
+  if (
+    exhaustedMaxWaitMs > 0 &&
+    Date.now() - exhaustedStartedAt + waitMs > exhaustedMaxWaitMs
+  ) {
+    throw new Error(
+      `[proxy] No reachable proxy after ${max} tries (${tag}) and waited ${formatDuration(
+        Date.now() - exhaustedStartedAt
+      )}. Disable with PROXY_HEALTH_CHECK=0, fix PROXY_HEALTH_CHECK_URL, or raise PROXY_EXHAUSTED_MAX_WAIT_MS`
+    );
+  }
+  rotator.exhaustedWaitCount = (rotator.exhaustedWaitCount || 0) + 1;
   if (shortestCooldownMs > 0 && Number.isFinite(shortestCooldownMs)) {
     console.warn(
-      `[proxy] All proxies are cooling down; waiting ${formatDuration(shortestCooldownMs)} (${tag})`
+      `[proxy] All proxies are cooling down; waiting ${formatDuration(waitMs)} before retry ${rotator.exhaustedWaitCount} (${tag})`
     );
-    await sleep(shortestCooldownMs);
+    await sleep(waitMs);
     return skipUntilHealthyProxy(rotator, tag);
   }
 
-  throw new Error(
-    `[proxy] No reachable proxy after ${max} tries (${tag}). Disable with PROXY_HEALTH_CHECK=0 or fix PROXY_HEALTH_CHECK_URL`
+  console.warn(
+    `[proxy] No healthy proxy available right now; waiting ${formatDuration(waitMs)} before retry ${rotator.exhaustedWaitCount} (${tag})`
   );
+  await sleep(waitMs);
+  return skipUntilHealthyProxy(rotator, tag);
 }
 
 /** Stable id for a search (same filters → same id, ignores `page`). */
@@ -1854,6 +1904,10 @@ function parseMaxBrowserCount() {
   return Math.max(1, parsed);
 }
 
+function workerDeadSlotLogIntervalMs() {
+  return envInt("WORKER_DEAD_SLOT_LOG_INTERVAL_MS", 30_000, 1_000);
+}
+
 async function resolveRoleWorkerSlots(maxBrowserCount) {
   const workerCount = Math.max(1, Math.min(parseInt(String(maxBrowserCount), 10) || 1, 3));
   const slots = [];
@@ -1911,18 +1965,93 @@ async function maybeRunRoleWorkers() {
   }
 
   const workerSlots = await resolveRoleWorkerSlots(Math.min(maxBrowserCount, requestedRoles.length));
-  let nextRoleIndex = 0;
-  await Promise.all(
-    workerSlots.map(async (slot) => {
-      while (true) {
-        if (nextRoleIndex >= requestedRoles.length) break;
-        const role = requestedRoles[nextRoleIndex];
-        nextRoleIndex += 1;
-        console.log(`[worker] ${workerSlotDisplay(slot)} -> role "${role}"`);
-        await runRoleWorkerChildProcess(slot, role, process.argv.slice(2));
-      }
-    })
-  );
+  const pendingRoles = requestedRoles.map((role) => ({ role }));
+  const currentRolesBySlot = new Map();
+  const liveSlots = new Set(workerSlots);
+  const deadSlots = new Map();
+  const slotPollMs = 1_000;
+
+  const formatDeadSlotSummary = () =>
+    [...deadSlots.values()]
+      .map(
+        (failure) =>
+          `${workerSlotDisplay(failure.slot)} role "${failure.role}" at ${failure.failedAt}: ${failure.message}`
+      )
+      .join(" | ");
+
+  const logDeadSlotStatus = (label = "[worker] Dead slot status") => {
+    if (!deadSlots.size) return;
+    const activeRoles = [...currentRolesBySlot.entries()]
+      .map(([slot, role]) => `${workerSlotDisplay(slot)}="${role}"`)
+      .join(", ");
+    console.warn(
+      `${label}: ${formatDeadSlotSummary()}${activeRoles ? ` | active ${activeRoles}` : ""} | live=${liveSlots.size}/${workerSlots.length} | pending=${pendingRoles.length}`
+    );
+  };
+
+  const deadSlotLogTimer = setInterval(() => {
+    if (deadSlots.size > 0 && liveSlots.size > 0) {
+      logDeadSlotStatus();
+    }
+  }, workerDeadSlotLogIntervalMs());
+  deadSlotLogTimer.unref?.();
+
+  try {
+    await Promise.all(
+      workerSlots.map(async (slot) => {
+        while (liveSlots.has(slot)) {
+          const task = pendingRoles.shift();
+          if (!task) {
+            if (currentRolesBySlot.size === 0) {
+              return;
+            }
+            await sleep(slotPollMs);
+            continue;
+          }
+
+          const role = task.role;
+          currentRolesBySlot.set(slot, role);
+          console.log(`[worker] ${workerSlotDisplay(slot)} -> role "${role}"`);
+          try {
+            await runRoleWorkerChildProcess(slot, role, process.argv.slice(2));
+          } catch (error) {
+            currentRolesBySlot.delete(slot);
+            liveSlots.delete(slot);
+            pendingRoles.unshift(task);
+            deadSlots.set(slot, {
+              slot,
+              role,
+              failedAt: new Date().toISOString(),
+              message: error?.message || String(error),
+            });
+            console.error(
+              `[worker] ${workerSlotDisplay(slot)} died on role "${role}". ${liveSlots.size > 0 ? `Re-queued the role; ${liveSlots.size} slot(s) still alive.` : "No live slots remain."}`
+            );
+            logDeadSlotStatus("[worker] Dead slot");
+            return;
+          }
+          currentRolesBySlot.delete(slot);
+        }
+      })
+    );
+  } finally {
+    clearInterval(deadSlotLogTimer);
+  }
+
+  if (pendingRoles.length > 0) {
+    const failedSummary = deadSlots.size
+      ? formatDeadSlotSummary()
+      : "No dead slot details were recorded.";
+    throw new Error(
+      `[worker] All live slots stopped before completing ${pendingRoles.length} role(s): ${pendingRoles
+        .map((task) => `"${task.role}"`)
+        .join(", ")}. ${failedSummary}`
+    );
+  }
+
+  if (deadSlots.size > 0) {
+    logDeadSlotStatus("[worker] Completed with dead slot(s)");
+  }
   return true;
 }
 

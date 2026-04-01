@@ -72,53 +72,27 @@ function readFirstArrayBinding(mod, bindingNames) {
   };
 }
 
-function emailBindingNamesForGender(gender) {
-  switch (normalizeWorkerGender(gender)) {
-    case "male":
-      return ["EMAIL_USER_MALE_LIST", "EMAIL_USER_GENDER_LIST"];
-    case "female":
-      return ["EMAIL_USER_FEMALE_LIST"];
-    case "unknown":
-      return ["EMAIL_USER_UNKNOWN_LIST"];
-    default:
-      return ["EMAIL_USER_LIST"];
-  }
-}
-
 function emailBindingNamesForSlot(slot) {
   switch (normalizeWorkerSlot(slot)) {
     case 1:
-      return ["EMAIL_USER_FIRST_LIST", "EMAIL_USER_MALE_LIST", "EMAIL_USER_GENDER_LIST"];
+      return ["EMAIL_USER_FIRST_LIST"];
     case 2:
-      return ["EMAIL_USER_SECOND_LIST", "EMAIL_USER_FEMALE_LIST"];
+      return ["EMAIL_USER_SECOND_LIST"];
     case 3:
-      return ["EMAIL_USER_THIRD_LIST", "EMAIL_USER_UNKNOWN_LIST"];
+      return ["EMAIL_USER_THIRD_LIST"];
     default:
       return ["EMAIL_USER_LIST"];
-  }
-}
-
-function proxyBindingNamesForGender(gender) {
-  switch (normalizeWorkerGender(gender)) {
-    case "male":
-      return ["PROXIES_MALE_LIST"];
-    case "female":
-      return ["PROXIES_FEMALE_LIST"];
-    case "unknown":
-      return ["PROXIES_UNKNOWN_LIST"];
-    default:
-      return ["PROXIES_LIST"];
   }
 }
 
 function proxyBindingNamesForSlot(slot) {
   switch (normalizeWorkerSlot(slot)) {
     case 1:
-      return ["PROXIES_FIRST_LIST", "PROXIES_MALE_LIST"];
+      return ["PROXIES_FIRST_LIST"];
     case 2:
-      return ["PROXIES_SECOND_LIST", "PROXIES_FEMALE_LIST"];
+      return ["PROXIES_SECOND_LIST"];
     case 3:
-      return ["PROXIES_THIRD_LIST", "PROXIES_UNKNOWN_LIST"];
+      return ["PROXIES_THIRD_LIST"];
     default:
       return ["PROXIES_LIST"];
   }
@@ -153,6 +127,7 @@ function replaceOrAppendArrayBinding(raw, bindingName, values) {
   if (replaced != null) {
     return replaced;
   }
+  const replacement = `export const ${bindingName} = ${formatArrayBindingSource(values)};`;
   const suffix = raw.endsWith("\n") ? "" : "\n";
   return `${raw}${suffix}\n${replacement}\n`;
 }
@@ -167,9 +142,6 @@ export async function inspectEmailPools(options = {}) {
       first: [],
       second: [],
       third: [],
-      male: [],
-      female: [],
-      unknown: [],
       hasGenderSpecific: false,
       hasSlotSpecific: false,
     };
@@ -179,9 +151,6 @@ export async function inspectEmailPools(options = {}) {
   const first = readFirstArrayBinding(mod, emailBindingNamesForSlot(1)).values;
   const second = readFirstArrayBinding(mod, emailBindingNamesForSlot(2)).values;
   const third = readFirstArrayBinding(mod, emailBindingNamesForSlot(3)).values;
-  const male = readFirstArrayBinding(mod, emailBindingNamesForGender("male")).values;
-  const female = readFirstArrayBinding(mod, emailBindingNamesForGender("female")).values;
-  const unknown = readFirstArrayBinding(mod, emailBindingNamesForGender("unknown")).values;
   const password =
     typeof mod.CONTACTOUT_PASSWORD === "string"
       ? mod.CONTACTOUT_PASSWORD.trim()
@@ -194,17 +163,13 @@ export async function inspectEmailPools(options = {}) {
     first,
     second,
     third,
-    male,
-    female,
-    unknown,
-    hasGenderSpecific: Boolean(male.length || female.length || unknown.length),
+    hasGenderSpecific: false,
     hasSlotSpecific: Boolean(first.length || second.length || third.length),
   };
 }
 
 export async function loadEmailConfig(options = {}) {
   const workerSlot = normalizeWorkerSlot(options.workerSlot);
-  const workerGender = normalizeWorkerGender(options.workerGender);
   const info = await inspectEmailPools({ fresh: options.fresh });
 
   if (!info.source) {
@@ -214,7 +179,7 @@ export async function loadEmailConfig(options = {}) {
       source: "",
       bindingName: "EMAIL_USER_LIST",
       workerSlot,
-      workerGender,
+      workerGender: "",
       hasGenderSpecific: false,
       hasSlotSpecific: false,
     };
@@ -232,25 +197,7 @@ export async function loadEmailConfig(options = {}) {
       source: EMAILS_CONFIG_PATH,
       bindingName,
       workerSlot,
-      workerGender,
-      hasGenderSpecific: info.hasGenderSpecific,
-      hasSlotSpecific: info.hasSlotSpecific,
-    };
-  }
-
-  if (workerGender) {
-    const mod = await importFreshModule(EMAILS_CONFIG_PATH, Boolean(options.fresh));
-    const { bindingName, values } = readFirstArrayBinding(
-      mod,
-      emailBindingNamesForGender(workerGender)
-    );
-    return {
-      emailPool: values,
-      password: info.password,
-      source: EMAILS_CONFIG_PATH,
-      bindingName,
-      workerSlot,
-      workerGender,
+      workerGender: "",
       hasGenderSpecific: info.hasGenderSpecific,
       hasSlotSpecific: info.hasSlotSpecific,
     };
@@ -262,9 +209,6 @@ export async function loadEmailConfig(options = {}) {
         ...info.first,
         ...info.second,
         ...info.third,
-        ...info.male,
-        ...info.female,
-        ...info.unknown,
       ]);
 
   return {
@@ -285,18 +229,14 @@ export async function loadEmailConfig(options = {}) {
 
 export function saveEmailPoolToConfigFile(emailPool, options = {}) {
   const workerSlot = normalizeWorkerSlot(options.workerSlot);
-  const workerGender = normalizeWorkerGender(options.workerGender);
   const bindingName =
     options.bindingName ||
     (workerSlot ? emailBindingNamesForSlot(workerSlot)[0] : "") ||
-    emailBindingNamesForGender(workerGender)[0] ||
     "EMAIL_USER_LIST";
   const bindingCandidates = options.bindingName
     ? [options.bindingName]
     : workerSlot
       ? emailBindingNamesForSlot(workerSlot)
-    : workerGender
-      ? emailBindingNamesForGender(workerGender)
       : ["EMAIL_USER_LIST"];
 
   const raw = fs.readFileSync(EMAILS_CONFIG_PATH, "utf8");
@@ -323,9 +263,6 @@ export async function inspectProxyPools(options = {}) {
       first: [],
       second: [],
       third: [],
-      male: [],
-      female: [],
-      unknown: [],
       hasGenderSpecific: false,
       hasSlotSpecific: false,
     };
@@ -335,9 +272,6 @@ export async function inspectProxyPools(options = {}) {
   const first = readFirstArrayBinding(mod, proxyBindingNamesForSlot(1)).values;
   const second = readFirstArrayBinding(mod, proxyBindingNamesForSlot(2)).values;
   const third = readFirstArrayBinding(mod, proxyBindingNamesForSlot(3)).values;
-  const male = readFirstArrayBinding(mod, proxyBindingNamesForGender("male")).values;
-  const female = readFirstArrayBinding(mod, proxyBindingNamesForGender("female")).values;
-  const unknown = readFirstArrayBinding(mod, proxyBindingNamesForGender("unknown")).values;
 
   return {
     source: PROXIES_CONFIG_PATH,
@@ -345,17 +279,13 @@ export async function inspectProxyPools(options = {}) {
     first,
     second,
     third,
-    male,
-    female,
-    unknown,
-    hasGenderSpecific: Boolean(male.length || female.length || unknown.length),
+    hasGenderSpecific: false,
     hasSlotSpecific: Boolean(first.length || second.length || third.length),
   };
 }
 
 export async function loadProxyConfig(options = {}) {
   const workerSlot = normalizeWorkerSlot(options.workerSlot);
-  const workerGender = normalizeWorkerGender(options.workerGender);
   const info = await inspectProxyPools({ fresh: options.fresh });
 
   if (!info.source) {
@@ -364,7 +294,7 @@ export async function loadProxyConfig(options = {}) {
       source: "",
       bindingName: "PROXIES_LIST",
       workerSlot,
-      workerGender,
+      workerGender: "",
       hasGenderSpecific: false,
       hasSlotSpecific: false,
     };
@@ -381,24 +311,7 @@ export async function loadProxyConfig(options = {}) {
       source: PROXIES_CONFIG_PATH,
       bindingName,
       workerSlot,
-      workerGender,
-      hasGenderSpecific: info.hasGenderSpecific,
-      hasSlotSpecific: info.hasSlotSpecific,
-    };
-  }
-
-  if (workerGender) {
-    const mod = await importFreshModule(PROXIES_CONFIG_PATH, Boolean(options.fresh));
-    const { bindingName, values } = readFirstArrayBinding(
-      mod,
-      proxyBindingNamesForGender(workerGender)
-    );
-    return {
-      proxyLines: values,
-      source: PROXIES_CONFIG_PATH,
-      bindingName,
-      workerSlot,
-      workerGender,
+      workerGender: "",
       hasGenderSpecific: info.hasGenderSpecific,
       hasSlotSpecific: info.hasSlotSpecific,
     };
@@ -410,9 +323,6 @@ export async function loadProxyConfig(options = {}) {
         ...info.first,
         ...info.second,
         ...info.third,
-        ...info.male,
-        ...info.female,
-        ...info.unknown,
       ]);
 
   return {
