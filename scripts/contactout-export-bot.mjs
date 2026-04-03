@@ -12,8 +12,11 @@
  *   CONTACTOUT_PASSWORD — fallback when account config file is absent
  *   EMAIL_USER — fallback one account; or EMAIL_USER1, EMAIL_USER2, … (same password for all)
  *   EMAIL_USERS — fallback comma/newline list alternative to numbered vars
- *   On HTTP 429 with multiple emails, the bot advances to the next email and clears
- *     session (cookies + storage-state when using proxies) before re-login.
+ *   On HTTP 429 with multiple emails, the bot advances to the next email, puts the
+ *     current email on cooldown, and clears session (cookies + storage-state when
+ *     using proxies) before re-login.
+ *   EMAIL_429_COOLDOWN_HOURS — cooldown before a 429-limited email is reused
+ *     (default 24 hours)
  *   SEARCH_COUNTRY_LIST — country/location filters for generated searches
  *   CONTACTOUT_LOCATION — optional explicit location override
  *   CONTACTOUT_SEARCH_URL — optional base URL (location, etc.); `page` is set by the bot
@@ -1295,13 +1298,17 @@ async function inspectSearchPageState(page) {
     const noResults = /no results|0 results|no people found|try adjusting your filters|we couldn'?t find/i.test(
       combined
     );
-    const blocked = /(^|\b)403(\b|$)|403 forbidden|forbidden|too many requests|rate limit|temporarily blocked|unusual traffic|access denied|verify you are human|captcha|security check|request unsuccessful|attention required|please enable cookies/i.test(
+    const rateLimited = /too many requests|rate limit|temporarily blocked|unusual traffic/i.test(
+      combined
+    );
+    const blocked = rateLimited || /(^|\b)403(\b|$)|403 forbidden|forbidden|access denied|verify you are human|captcha|security check|request unsuccessful|attention required|please enable cookies/i.test(
       combined
     );
     return {
       title,
       noResults,
       blocked,
+      rateLimited,
       hasPasswordInput,
     };
   });
@@ -1883,6 +1890,121 @@ function defaultHistoryPathForWorker(rootDir, workerSlot = 0) {
   );
 }
 
+function defaultEmailCooldownStatePathForWorker(rootDir, workerSlot = 0) {
+  const normalized = normalizeWorkerSlot(workerSlot);
+  if (!normalized) {
+    return path.join(rootDir, "ref", "email-cooldowns.json");
+  }
+  return path.join(
+    rootDir,
+    "ref",
+    "email-cooldowns",
+    `email-cooldown-slot-${normalized}.json`
+  );
+}
+
+function normalizeCooldownTimestampMs(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.max(0, Math.floor(value));
+  }
+  const raw = String(value ?? "").trim();
+  if (!raw) return 0;
+  if (/^\d+$/.test(raw)) {
+    const parsed = parseInt(raw, 10);
+    return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+  }
+  const parsedDate = Date.parse(raw);
+  return Number.isFinite(parsedDate) ? parsedDate : 0;
+}
+
+function loadPersistedEmailCooldowns(statePath) {
+  if (!statePath || !fs.existsSync(statePath)) {
+    return new Map();
+  }
+  try {
+    const raw = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    const items = Array.isArray(raw?.accounts)
+      ? raw.accounts
+      : Array.isArray(raw)
+        ? raw
+        : [];
+    const now = Date.now();
+    const byEmail = new Map();
+    for (const item of items) {
+      const email = String(item?.email || "").trim();
+      const normalized = email.toLowerCase();
+      const cooldownUntil = normalizeCooldownTimestampMs(item?.cooldownUntil);
+      if (!normalized || cooldownUntil <= now) continue;
+      const parsedStatus = parseInt(String(item?.status ?? "").trim(), 10);
+      byEmail.set(normalized, {
+        email,
+        cooldownUntil,
+        status: Number.isFinite(parsedStatus) ? parsedStatus : 429,
+        reason: String(item?.reason || "").trim(),
+        updatedAt:
+          normalizeCooldownTimestampMs(item?.updatedAt) || Date.now(),
+      });
+    }
+    return byEmail;
+  } catch (error) {
+    console.warn(
+      `[auth] Failed to read email cooldown state ${statePath}: ${String(error?.message || error)}`
+    );
+    return new Map();
+  }
+}
+
+function savePersistedEmailCooldowns(statePath, cooldownsByEmail) {
+  if (!statePath) return;
+  const now = Date.now();
+  const accounts = [...cooldownsByEmail.values()]
+    .filter(
+      (entry) => normalizeCooldownTimestampMs(entry?.cooldownUntil) > now
+    )
+    .sort(
+      (a, b) =>
+        a.cooldownUntil - b.cooldownUntil || a.email.localeCompare(b.email)
+    )
+    .map((entry) => {
+      const status = parseInt(String(entry?.status ?? "").trim(), 10);
+      const updatedAt =
+        normalizeCooldownTimestampMs(entry?.updatedAt) || now;
+      return {
+        email: entry.email,
+        cooldownUntil: new Date(entry.cooldownUntil).toISOString(),
+        status: Number.isFinite(status) ? status : 429,
+        reason: String(entry?.reason || "").trim(),
+        updatedAt: new Date(updatedAt).toISOString(),
+      };
+    });
+
+  if (!accounts.length) {
+    try {
+      if (fs.existsSync(statePath)) {
+        fs.unlinkSync(statePath);
+      }
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
+
+  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  fs.writeFileSync(
+    statePath,
+    JSON.stringify(
+      {
+        version: 1,
+        updatedAt: new Date(now).toISOString(),
+        accounts,
+      },
+      null,
+      2
+    ) + "\n",
+    "utf8"
+  );
+}
+
 function rawExportRootForWorker(exportDir, workerSlot = 0) {
   return path.join(exportDir, "_raw", runtimeWorkerKey(workerSlot));
 }
@@ -2164,6 +2286,8 @@ async function main() {
     20,
     1
   );
+  const email429CooldownHours = envInt("EMAIL_429_COOLDOWN_HOURS", 24, 1);
+  const email429CooldownMs = email429CooldownHours * 60 * 60_000;
   const accountCooldownMs =
     envInt("ACCOUNT_COOLDOWN_MINUTES", 72, 0) * 60_000;
   const pageSettleDelayMinMs = envInt("PAGE_SETTLE_DELAY_MIN_MS", 1200, 0);
@@ -2182,12 +2306,23 @@ async function main() {
     10 * 60_000,
     0
   );
+  const emailCooldownStatePath = defaultEmailCooldownStatePathForWorker(
+    ROOT,
+    workerSlot
+  );
   console.log(`[auth] Loaded accounts from ${accountConfig.source}`);
+  let persistedEmailCooldownsByEmail = loadPersistedEmailCooldowns(
+    emailCooldownStatePath
+  );
+  savePersistedEmailCooldowns(
+    emailCooldownStatePath,
+    persistedEmailCooldownsByEmail
+  );
   let accountStates = emailPool.map((email, index) => ({
     index,
     email,
     activatedAt: 0,
-    cooldownUntil: 0,
+    cooldownUntil: getPersistedEmailCooldownUntil(email),
     successfulPages: 0,
   }));
   let activeAccountIndex = 0;
@@ -2204,11 +2339,120 @@ async function main() {
     return accountStates[safeIndex];
   };
   const currentEmail = () => currentAccount().email;
+  function reloadPersistedEmailCooldowns() {
+    persistedEmailCooldownsByEmail = loadPersistedEmailCooldowns(
+      emailCooldownStatePath
+    );
+    savePersistedEmailCooldowns(
+      emailCooldownStatePath,
+      persistedEmailCooldownsByEmail
+    );
+    return persistedEmailCooldownsByEmail;
+  }
+  function getPersistedEmailCooldownUntil(email) {
+    const normalized = String(email || "").trim().toLowerCase();
+    if (!normalized) return 0;
+    const entry = persistedEmailCooldownsByEmail.get(normalized);
+    return normalizeCooldownTimestampMs(entry?.cooldownUntil);
+  }
+  function setPersistedEmailCooldown(email, cooldownUntil, options = {}) {
+    const normalized = String(email || "").trim().toLowerCase();
+    const cleanEmail = String(email || "").trim();
+    const until = normalizeCooldownTimestampMs(cooldownUntil);
+    if (!normalized || !cleanEmail || until <= Date.now()) {
+      return 0;
+    }
+    const parsedStatus = parseInt(
+      String(options.status ?? "").trim(),
+      10
+    );
+    persistedEmailCooldownsByEmail.set(normalized, {
+      email: cleanEmail,
+      cooldownUntil: until,
+      status: Number.isFinite(parsedStatus) ? parsedStatus : 429,
+      reason: String(options.reason || "").trim(),
+      updatedAt: Date.now(),
+    });
+    savePersistedEmailCooldowns(
+      emailCooldownStatePath,
+      persistedEmailCooldownsByEmail
+    );
+    return until;
+  }
+  function clearPersistedEmailCooldown(email) {
+    const normalized = String(email || "").trim().toLowerCase();
+    if (!normalized) return false;
+    const removed = persistedEmailCooldownsByEmail.delete(normalized);
+    if (removed) {
+      savePersistedEmailCooldowns(
+        emailCooldownStatePath,
+        persistedEmailCooldownsByEmail
+      );
+    }
+    return removed;
+  }
+  if (persistedEmailCooldownsByEmail.size > 0) {
+    console.log(
+      `[auth] Loaded ${persistedEmailCooldownsByEmail.size} persisted 429 cooldown(s)${workerSlot ? ` for ${workerSlotDisplay(workerSlot)}` : ""}.`
+    );
+  }
   console.log(
-    `[auth] ${emailPool.length} account(s)${workerSlot ? ` for ${workerSlotDisplay(workerSlot)}` : ""}; rotate after ${accountRotateSuccessPages} successful pages, cooldown ${Math.round(accountCooldownMs / 60000)} minute(s)`
+    `[auth] ${emailPool.length} account(s)${workerSlot ? ` for ${workerSlotDisplay(workerSlot)}` : ""}; rotate after ${accountRotateSuccessPages} successful pages, cooldown ${Math.round(accountCooldownMs / 60000)} minute(s), 429 cooldown ${email429CooldownHours} hour(s)`
   );
 
   let history = loadSearchHistory(historyPath);
+  const getSearchHistoryEntry = (searchBaseUrl) => {
+    if (ignoreSearchHistory) return null;
+    const searchId = searchIdFromBaseUrl(searchBaseUrl);
+    return history.searches?.[searchId] || null;
+  };
+  const searchHistoryLastUpdatedMs = (searchBaseUrl) => {
+    const lastUpdated = getSearchHistoryEntry(searchBaseUrl)?.lastUpdated;
+    const parsed = Date.parse(String(lastUpdated || ""));
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+  const nextSearchPageFromHistory = (searchBaseUrl, firstPage = 1) => {
+    const entry = getSearchHistoryEntry(searchBaseUrl);
+    const completedPages = Array.isArray(entry?.pagesCompleted)
+      ? entry.pagesCompleted
+      : [];
+    if (!completedPages.length) return firstPage;
+    const completedSet = new Set(
+      completedPages.filter(
+        (pageNum) => Number.isInteger(pageNum) && pageNum >= firstPage
+      )
+    );
+    let nextPage = firstPage;
+    while (completedSet.has(nextPage)) {
+      nextPage += 1;
+    }
+    return nextPage;
+  };
+  const sortPlansByResumePriority = (plans) => {
+    if (ignoreSearchHistory || !Array.isArray(plans) || plans.length <= 1) {
+      return Array.isArray(plans) ? plans : [];
+    }
+    return plans
+      .map((plan, index) => ({
+        plan,
+        index,
+        lastUpdatedMs: searchHistoryLastUpdatedMs(
+          normalizeSearchBaseUrl(plan.searchUrlRaw)
+        ),
+      }))
+      .sort((a, b) => {
+        const aHasHistory = a.lastUpdatedMs > 0;
+        const bHasHistory = b.lastUpdatedMs > 0;
+        if (aHasHistory !== bHasHistory) {
+          return aHasHistory ? -1 : 1;
+        }
+        if (a.lastUpdatedMs !== b.lastUpdatedMs) {
+          return b.lastUpdatedMs - a.lastUpdatedMs;
+        }
+        return a.index - b.index;
+      })
+      .map((item) => item.plan);
+  };
   const mergePlansByKey = new Map(
     mergePlans.map((mergePlan) => [mergePlan.mergeKey, mergePlan])
   );
@@ -2575,6 +2819,7 @@ async function main() {
   }
 
   async function refreshAccountStatesFromSource(reason = "", preferredEmail = "") {
+    reloadPersistedEmailCooldowns();
     const freshConfig = await loadAccountsConfig({
       fresh: true,
       workerSlot,
@@ -2585,18 +2830,23 @@ async function main() {
     );
     const nextStates = freshConfig.emailPool.map((email, index) => {
       const existing = previousByEmail.get(String(email).toLowerCase());
+      const persistedCooldownUntil = getPersistedEmailCooldownUntil(email);
       if (existing) {
         return {
           ...existing,
           index,
           email,
+          cooldownUntil: Math.max(
+            existing.cooldownUntil || 0,
+            persistedCooldownUntil
+          ),
         };
       }
       return {
         index,
         email,
         activatedAt: 0,
-        cooldownUntil: 0,
+        cooldownUntil: persistedCooldownUntil,
         successfulPages: 0,
       };
     });
@@ -2658,6 +2908,7 @@ async function main() {
       workerSlot,
       bindingName: accountConfigBindingName,
     });
+    clearPersistedEmailCooldown(email);
     console.warn(
       `[auth] Auto-removed ${email} from the ${workerSlot ? workerSlotDisplay(workerSlot) : "default"} email pool${reason ? ` (${reason})` : ""}.`
     );
@@ -2679,24 +2930,40 @@ async function main() {
     );
   }
 
-  function markCurrentAccountCoolingDown(reason = "") {
+  function markCurrentAccountCoolingDown(reason = "", options = {}) {
     const account = currentAccount();
     if (!account) return;
-    const activatedAt = account.activatedAt || Date.now();
-    const nextAvailableAt = activatedAt + accountCooldownMs;
+    const durationMs =
+      options.durationMs === undefined
+        ? accountCooldownMs
+        : Math.max(0, options.durationMs);
+    const baseTime =
+      options.useActivatedAtBase === false
+        ? Date.now()
+        : account.activatedAt || Date.now();
+    const nextAvailableAt = baseTime + durationMs;
     account.cooldownUntil = Math.max(account.cooldownUntil || 0, nextAvailableAt);
-    if (accountCooldownMs > 0) {
+    if (options.persist) {
+      setPersistedEmailCooldown(account.email, account.cooldownUntil, {
+        reason,
+        status: options.status,
+      });
+    }
+    if (durationMs > 0) {
       console.log(
-        `[auth] Cooldown ${account.email} until ${new Date(account.cooldownUntil).toISOString()}${reason ? ` (${reason})` : ""}`
+        `[auth] ${options.persist ? "Persisted cooldown" : "Cooldown"} ${account.email} until ${new Date(account.cooldownUntil).toISOString()}${reason ? ` (${reason})` : ""}`
       );
     }
+    return account.cooldownUntil;
   }
 
-  function nextAvailableAccountIndex() {
+  function nextAvailableAccountIndex(startIndex = activeAccountIndex) {
     if (!accountStates.length) return -1;
     const now = Date.now();
     for (let offset = 1; offset <= accountStates.length; offset++) {
-      const index = (activeAccountIndex + offset) % accountStates.length;
+      const index =
+        ((startIndex + offset) % accountStates.length + accountStates.length) %
+        accountStates.length;
       if ((accountStates[index].cooldownUntil || 0) <= now) {
         return index;
       }
@@ -2791,6 +3058,17 @@ async function main() {
     const penalizeCurrentProxyMs = Math.max(0, options.penalizeCurrentProxyMs || 0);
     const clearSession = options.clearSession !== false;
     const removeCurrentAccount = Boolean(options.removeCurrentAccount);
+    const cooldownCurrentAccountMs = Math.max(
+      0,
+      options.cooldownCurrentAccountMs || 0
+    );
+    const persistCurrentAccountCooldown = Boolean(
+      options.persistCurrentAccountCooldown
+    );
+    const currentAccountStatus = parseInt(
+      String(options.currentAccountStatus ?? "").trim(),
+      10
+    );
     const activeEmailBeforeRotation =
       accountStates.length > 0 ? currentAccount().email : "";
 
@@ -2811,7 +3089,18 @@ async function main() {
         activeEmailBeforeRotation
       );
       if (refreshResult?.preferredFound) {
-        markCurrentAccountCoolingDown(reason);
+        if (cooldownCurrentAccountMs > 0) {
+          markCurrentAccountCoolingDown(reason, {
+            durationMs: cooldownCurrentAccountMs,
+            useActivatedAtBase: false,
+            persist: persistCurrentAccountCooldown,
+            status: Number.isFinite(currentAccountStatus)
+              ? currentAccountStatus
+              : undefined,
+          });
+        } else {
+          markCurrentAccountCoolingDown(reason);
+        }
       } else if (activeEmailBeforeRotation) {
         console.log(
           `[auth] Skipping cooldown for removed account ${activeEmailBeforeRotation} (${reason}).`
@@ -2858,7 +3147,21 @@ async function main() {
     await sleepRandom(pageGapDelayMinMs, pageGapDelayMaxMs);
   }
 
-  activateAccount(activeAccountIndex, "startup");
+  let startupAccountIndex = nextAvailableAccountIndex(-1);
+  if (startupAccountIndex < 0) {
+    const waitMs = soonestAccountCooldownMs();
+    if (waitMs && Number.isFinite(waitMs) && waitMs > 0) {
+      console.log(
+        `[auth] All accounts are cooling down at startup; waiting ${formatDuration(waitMs)} before logging in.`
+      );
+      await sleep(waitMs);
+    }
+    startupAccountIndex = nextAvailableAccountIndex(-1);
+  }
+  if (startupAccountIndex < 0) {
+    startupAccountIndex = 0;
+  }
+  activateAccount(startupAccountIndex, "startup");
   await recreateProxyContext("startup", {
     clearSession: false,
     advanceProxy: false,
@@ -2963,7 +3266,10 @@ async function main() {
         await rotateAccountProxyPair(statusLabel, {
           clearSession: true,
           penalizeCurrentProxyMs: proxyBlockedCooldownMs,
-          removeCurrentAccount: true,
+          removeCurrentAccount: st === 403,
+          cooldownCurrentAccountMs: st === 429 ? email429CooldownMs : 0,
+          persistCurrentAccountCooldown: st === 429,
+          currentAccountStatus: st,
         });
         continue;
       }
@@ -3283,31 +3589,31 @@ async function main() {
   const runSearchPlan = async (plan) => {
     const searchBaseUrl = normalizeSearchBaseUrl(plan.searchUrlRaw);
     const searchId = searchIdFromBaseUrl(searchBaseUrl);
-    const exportNameSuffix = plan.exportNameSuffix;
-    const exportFolderParts = buildExportFolderParts({
-      country: plan.country,
-      role: plan.role,
-      gender: plan.gender,
-      years: plan.years,
-      totalYears: plan.totalYears,
-      employeeSize: plan.employeeSize,
-      revenueMin: plan.revenueMin,
-      revenueMax: plan.revenueMax,
-      industry: plan.industry,
-    });
+    const historyEntry = getSearchHistoryEntry(searchBaseUrl);
+    const resumePage = nextSearchPageFromHistory(searchBaseUrl, startPage);
+    const canResumeDirectly =
+      !ignoreSearchHistory &&
+      Array.isArray(historyEntry?.pagesCompleted) &&
+      historyEntry.pagesCompleted.length > 0 &&
+      resumePage > startPage;
     const firstUrl = buildSearchUrlWithPage(searchBaseUrl, startPage);
+    const entryPage = canResumeDirectly ? resumePage : startPage;
+    const entryUrl = buildSearchUrlWithPage(searchBaseUrl, entryPage);
     console.log(
       `[contactout-bot] Starting search${plan.role ? ` (role=${plan.role})` : ""}${plan.gender ? ` (gender=${plan.gender})` : ""}: ${searchBaseUrl}`
     );
     await gotoWith429Retry(
-      firstUrl,
-      `first search page${plan.role ? ` role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}`
+      entryUrl,
+      `${canResumeDirectly ? `resume page=${resumePage}` : "first search page"}${plan.role ? ` role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}`
     );
 
     if (pathnameLooksLikeLogin(page.url())) {
       console.log("[contactout-bot] Not logged in; signing inвЂ¦");
       await login(page, currentEmail(), accountPassword);
-      await gotoWith429Retry(firstUrl, "after login");
+      await gotoWith429Retry(
+        entryUrl,
+        canResumeDirectly ? `after login resume page=${resumePage}` : "after login"
+      );
       loggedIn = true;
     } else if (!loggedIn) {
       console.log("[contactout-bot] Already logged in; continuing with search.");
@@ -3321,75 +3627,94 @@ async function main() {
       if (rotator) await persistSession();
     }
 
-    const reloadFirstSearchPage = async () => {
-      await gotoWith429Retry(
-        firstUrl,
-        `first search page retry${plan.role ? ` role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}`
+    let profileCount = null;
+    if (canResumeDirectly) {
+      console.log(
+        `[contactout-bot] Resuming directly from page ${resumePage}${plan.role ? ` role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""} based on ${path.basename(historyPath)}.`
       );
-      if (pathnameLooksLikeLogin(page.url())) {
-        await login(page, currentEmail(), accountPassword);
-        await gotoWith429Retry(firstUrl, "after re-login first search page");
-        if (rotator) await persistSession();
-      }
-    };
-
-    const readProfileCountFromHealthyFirstPage = async () => {
-      for (let attempt = 0; attempt <= emptyPageRetryMax; attempt++) {
-        if (attempt > 0) {
-          await reloadFirstSearchPage();
-          await sleepRandom(pageSettleDelayMinMs, pageSettleDelayMaxMs);
+    } else {
+      const reloadFirstSearchPage = async () => {
+        await gotoWith429Retry(
+          firstUrl,
+          `first search page retry${plan.role ? ` role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}`
+        );
+        if (pathnameLooksLikeLogin(page.url())) {
+          await login(page, currentEmail(), accountPassword);
+          await gotoWith429Retry(firstUrl, "after re-login first search page");
+          if (rotator) await persistSession();
         }
+      };
 
-        const profileCount = await extractProfileCount(page);
-        if (profileCount) return profileCount;
-
-        const rows = await scrapeCurrentPageRows(page, plan.role);
-        const pageState = await inspectSearchPageState(page);
-        const looksLikeLogin =
-          pathnameLooksLikeLogin(page.url()) || pageState.hasPasswordInput;
-        const suspicious =
-          pageState.blocked || looksLikeLogin || (!pageState.noResults && rows.length === 0);
-
-        if (attempt < emptyPageRetryMax && (suspicious || rows.length > 0)) {
-          console.warn(
-            `[contactout-bot] Profile count not readable on first page; retry ${attempt + 1}/${emptyPageRetryMax}.`
-          );
-          if (suspicious && (pageState.blocked || looksLikeLogin)) {
-            await rotateAccountProxyPair("blocked first search page", {
-              clearSession: true,
-              penalizeCurrentProxyMs: proxyBlockedCooldownMs,
-              removeCurrentAccount: true,
-            });
-          } else if (suspicious) {
-            rotator?.markCooldown(proxyFailureCooldownMs, "incomplete first search page");
-            await recreateProxyContext("incomplete first search page", {
-              clearSession: false,
-              advanceProxy: Boolean(rotator),
-            });
-          } else {
-            await sleep(backoff429);
+      const readProfileCountFromHealthyFirstPage = async () => {
+        for (let attempt = 0; attempt <= emptyPageRetryMax; attempt++) {
+          if (attempt > 0) {
+            await reloadFirstSearchPage();
+            await sleepRandom(pageSettleDelayMinMs, pageSettleDelayMaxMs);
           }
-          continue;
+
+          const profileCountCandidate = await extractProfileCount(page);
+          if (profileCountCandidate) return profileCountCandidate;
+
+          const rows = await scrapeCurrentPageRows(page, plan.role);
+          const pageState = await inspectSearchPageState(page);
+          const looksLikeLogin =
+            pathnameLooksLikeLogin(page.url()) || pageState.hasPasswordInput;
+          const suspicious =
+            pageState.blocked || looksLikeLogin || (!pageState.noResults && rows.length === 0);
+
+          if (attempt < emptyPageRetryMax && (suspicious || rows.length > 0)) {
+            console.warn(
+              `[contactout-bot] Profile count not readable on first page; retry ${attempt + 1}/${emptyPageRetryMax}.`
+            );
+            if (suspicious && (pageState.blocked || looksLikeLogin)) {
+              const rateLimitedBlock = Boolean(pageState.rateLimited);
+              await rotateAccountProxyPair(
+                rateLimitedBlock
+                  ? "rate-limited first search page"
+                  : "blocked first search page",
+                {
+                  clearSession: true,
+                  penalizeCurrentProxyMs: proxyBlockedCooldownMs,
+                  removeCurrentAccount: !rateLimitedBlock,
+                  cooldownCurrentAccountMs: rateLimitedBlock
+                    ? email429CooldownMs
+                    : 0,
+                  persistCurrentAccountCooldown: rateLimitedBlock,
+                  currentAccountStatus: rateLimitedBlock ? 429 : 403,
+                }
+              );
+            } else if (suspicious) {
+              rotator?.markCooldown(proxyFailureCooldownMs, "incomplete first search page");
+              await recreateProxyContext("incomplete first search page", {
+                clearSession: false,
+                advanceProxy: Boolean(rotator),
+              });
+            } else {
+              await sleep(backoff429);
+            }
+            continue;
+          }
+
+          return null;
         }
 
         return null;
+      };
+
+      profileCount = await readProfileCountFromHealthyFirstPage();
+      if (profileCount) {
+        console.log(
+          `[contactout-bot] Profile count${plan.role ? ` for role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}${plan.revenueMin || plan.revenueMax ? ` revenue=${plan.revenueMin || "min"}-${plan.revenueMax || "plus"}` : ""}${plan.industry ? ` industry=${plan.industry}` : ""}: ${profileCount.total} (${profileCount.summary})`
+        );
+      } else {
+        console.warn(
+          `[contactout-bot] Profile count${plan.role ? ` for role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}${plan.revenueMin || plan.revenueMax ? ` revenue=${plan.revenueMin || "min"}-${plan.revenueMax || "plus"}` : ""}${plan.industry ? ` industry=${plan.industry}` : ""}: not found after first-page retries; proceeding without priority split`
+        );
       }
-
-      return null;
-    };
-
-    const profileCount = await readProfileCountFromHealthyFirstPage();
-    if (profileCount) {
-      console.log(
-        `[contactout-bot] Profile count${plan.role ? ` for role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}${plan.revenueMin || plan.revenueMax ? ` revenue=${plan.revenueMin || "min"}-${plan.revenueMax || "plus"}` : ""}${plan.industry ? ` industry=${plan.industry}` : ""}: ${profileCount.total} (${profileCount.summary})`
-      );
-    } else {
-      console.warn(
-        `[contactout-bot] Profile count${plan.role ? ` for role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}${plan.revenueMin || plan.revenueMax ? ` revenue=${plan.revenueMin || "min"}-${plan.revenueMax || "plus"}` : ""}${plan.industry ? ` industry=${plan.industry}` : ""}: not found after first-page retries; proceeding without priority split`
-      );
     }
 
     if (
+      !canResumeDirectly &&
       profileCount &&
       profileCount.total > searchProfileThreshold &&
       !plan.years &&
@@ -3398,23 +3723,25 @@ async function main() {
       console.log(
         `[contactout-bot] gender=${plan.gender} has ${profileCount.total} profiles (> ${searchProfileThreshold}); splitting by years: ${searchYearsList.join(", ")}`
       );
-      for (const years of searchYearsList) {
-        await runSearchPlan({
-          ...plan,
-          searchUrlRaw: setSearchParam(searchBaseUrl, "years", years),
-          exportNameSuffix: buildExportNameSuffix({
-            country: plan.country,
-            role: plan.role,
-            gender: plan.gender,
-            years,
-          }),
-          years: String(years).trim(),
-        });
+      const yearPlans = searchYearsList.map((years) => ({
+        ...plan,
+        searchUrlRaw: setSearchParam(searchBaseUrl, "years", years),
+        exportNameSuffix: buildExportNameSuffix({
+          country: plan.country,
+          role: plan.role,
+          gender: plan.gender,
+          years,
+        }),
+        years: String(years).trim(),
+      }));
+      for (const yearPlan of sortPlansByResumePriority(yearPlans)) {
+        await runSearchPlan(yearPlan);
       }
       return;
     }
 
     if (
+      !canResumeDirectly &&
       profileCount &&
       profileCount.total > searchProfileThreshold &&
       !plan.employeeSize &&
@@ -3428,8 +3755,7 @@ async function main() {
       console.log(
         `[contactout-bot]${plan.gender ? ` gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""} has ${profileCount.total} profiles (> ${searchProfileThreshold}); splitting by employee_size: ${searchEmployeeSizeList.join(", ")}`
       );
-      for (const employeeSize of searchEmployeeSizeList) {
-        await runSearchPlan({
+      const employeeSizePlans = searchEmployeeSizeList.map((employeeSize) => ({
           ...plan,
           searchUrlRaw: setSearchParam(searchBaseUrl, "employee_size", employeeSize),
           exportNameSuffix: buildExportNameSuffix({
@@ -3441,12 +3767,15 @@ async function main() {
             employeeSize,
           }),
           employeeSize: String(employeeSize).trim(),
-        });
+        }));
+      for (const employeeSizePlan of sortPlansByResumePriority(employeeSizePlans)) {
+        await runSearchPlan(employeeSizePlan);
       }
       return;
     }
 
     if (
+      !canResumeDirectly &&
       profileCount &&
       profileCount.total > searchProfileThreshold &&
       !plan.totalYears &&
@@ -3456,24 +3785,26 @@ async function main() {
       console.log(
         `[contactout-bot]${plan.gender ? ` gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""} has ${profileCount.total} profiles (> ${searchProfileThreshold}); splitting by totalYears: ${searchTotalYearsList.join(", ")}`
       );
-      for (const totalYears of searchTotalYearsList) {
-        await runSearchPlan({
-          ...plan,
-          searchUrlRaw: setSearchParam(searchBaseUrl, "totalYears", totalYears),
-          exportNameSuffix: buildExportNameSuffix({
-            country: plan.country,
-            role: plan.role,
-            gender: plan.gender,
-            years: plan.years,
-            totalYears,
-          }),
-          totalYears: String(totalYears).trim(),
-        });
+      const totalYearsPlans = searchTotalYearsList.map((totalYears) => ({
+        ...plan,
+        searchUrlRaw: setSearchParam(searchBaseUrl, "totalYears", totalYears),
+        exportNameSuffix: buildExportNameSuffix({
+          country: plan.country,
+          role: plan.role,
+          gender: plan.gender,
+          years: plan.years,
+          totalYears,
+        }),
+        totalYears: String(totalYears).trim(),
+      }));
+      for (const totalYearsPlan of sortPlansByResumePriority(totalYearsPlans)) {
+        await runSearchPlan(totalYearsPlan);
       }
       return;
     }
 
     if (
+      !canResumeDirectly &&
       profileCount &&
       profileCount.total > searchProfileThreshold &&
       !(plan.revenueMin || plan.revenueMax) &&
@@ -3488,11 +3819,11 @@ async function main() {
       console.log(
         `[contactout-bot]${plan.gender ? ` gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""} has ${profileCount.total} profiles (> ${searchProfileThreshold}); splitting by revenue: ${searchRevenueRanges.map((range) => `${range.revenueMin || "min"}-${range.revenueMax || "plus"}`).join(", ")}`
       );
-      for (const range of searchRevenueRanges) {
+      const revenuePlans = searchRevenueRanges.map((range) => {
         let nextUrl = searchBaseUrl;
         nextUrl = setSearchParam(nextUrl, "revenue_min", range.revenueMin);
         nextUrl = setSearchParam(nextUrl, "revenue_max", range.revenueMax);
-        await runSearchPlan({
+        return {
           ...plan,
           searchUrlRaw: nextUrl,
           exportNameSuffix: buildExportNameSuffix({
@@ -3507,12 +3838,16 @@ async function main() {
           }),
           revenueMin: range.revenueMin,
           revenueMax: range.revenueMax,
-        });
+        };
+      });
+      for (const revenuePlan of sortPlansByResumePriority(revenuePlans)) {
+        await runSearchPlan(revenuePlan);
       }
       return;
     }
 
     if (
+      !canResumeDirectly &&
       profileCount &&
       profileCount.total > searchProfileThreshold &&
       !plan.industry &&
@@ -3528,26 +3863,29 @@ async function main() {
       console.log(
         `[contactout-bot]${plan.gender ? ` gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}${plan.revenueMin || plan.revenueMax ? ` revenue=${plan.revenueMin || "min"}-${plan.revenueMax || "plus"}` : ""} has ${profileCount.total} profiles (> ${searchProfileThreshold}); splitting by industry: ${searchIndustryList.join(", ")}`
       );
-      for (const industry of searchIndustryList) {
-        await runSearchPlan({
-          ...plan,
-          searchUrlRaw: setSearchParam(searchBaseUrl, "industry", industry),
-          exportNameSuffix: buildExportNameSuffix({
-            country: plan.country,
-            role: plan.role,
-            gender: plan.gender,
-            years: plan.years,
-            totalYears: plan.totalYears,
-            employeeSize: plan.employeeSize,
-            revenueMin: plan.revenueMin,
-            revenueMax: plan.revenueMax,
-            industry,
-          }),
-          industry: String(industry).trim(),
-        });
+      const industryPlans = searchIndustryList.map((industry) => ({
+        ...plan,
+        searchUrlRaw: setSearchParam(searchBaseUrl, "industry", industry),
+        exportNameSuffix: buildExportNameSuffix({
+          country: plan.country,
+          role: plan.role,
+          gender: plan.gender,
+          years: plan.years,
+          totalYears: plan.totalYears,
+          employeeSize: plan.employeeSize,
+          revenueMin: plan.revenueMin,
+          revenueMax: plan.revenueMax,
+          industry,
+        }),
+        industry: String(industry).trim(),
+      }));
+      for (const industryPlan of sortPlansByResumePriority(industryPlans)) {
+        await runSearchPlan(industryPlan);
       }
       return;
     }
+
+    const effectiveStartPage = entryPage;
 
     const gotoSearchPage = async (pageNum) => {
       const urlThis = buildSearchUrlWithPage(searchBaseUrl, pageNum);
@@ -3588,11 +3926,22 @@ async function main() {
               `[contactout-bot] Page ${pageNum} returned 0 rows but looks blocked/incomplete; retry ${attempt + 1}/${emptyPageRetryMax}.`
             );
             if (pageState.blocked || looksLikeLogin) {
-              await rotateAccountProxyPair("blocked/empty result page", {
-                clearSession: true,
-                penalizeCurrentProxyMs: proxyBlockedCooldownMs,
-                removeCurrentAccount: true,
-              });
+              const rateLimitedBlock = Boolean(pageState.rateLimited);
+              await rotateAccountProxyPair(
+                rateLimitedBlock
+                  ? "rate-limited empty result page"
+                  : "blocked/empty result page",
+                {
+                  clearSession: true,
+                  penalizeCurrentProxyMs: proxyBlockedCooldownMs,
+                  removeCurrentAccount: !rateLimitedBlock,
+                  cooldownCurrentAccountMs: rateLimitedBlock
+                    ? email429CooldownMs
+                    : 0,
+                  persistCurrentAccountCooldown: rateLimitedBlock,
+                  currentAccountStatus: rateLimitedBlock ? 429 : 403,
+                }
+              );
             } else {
               rotator?.markCooldown(proxyFailureCooldownMs, "empty/incomplete result page");
               await recreateProxyContext("empty/incomplete result page", {
@@ -3642,7 +3991,7 @@ async function main() {
     };
 
     if (unlimitedPages) {
-      for (let pageNum = startPage; ; pageNum++) {
+      for (let pageNum = effectiveStartPage; ; pageNum++) {
         const res = await processPage(pageNum);
         if (res == null) continue;
         if (res.empty) {
@@ -3655,7 +4004,7 @@ async function main() {
       }
     } else {
       for (let i = 0; i < maxPages; i++) {
-        const pageNum = startPage + i;
+        const pageNum = effectiveStartPage + i;
         const res = await processPage(pageNum);
         if (res == null) continue;
         if (res.empty) {
@@ -3675,7 +4024,7 @@ async function main() {
   try {
     primePendingRawTasks();
 
-    for (const plan of searchPlans) {
+    for (const plan of sortPlansByResumePriority(searchPlans)) {
       await runSearchPlan(plan);
     }
 

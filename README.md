@@ -46,9 +46,10 @@ By default the browser window is visible. Set `HEADLESS=1` to run headless. **Pe
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `EMAIL_USER` | When login needed | One login email (alternative: see below) |
-| `EMAIL_USER1`, `EMAIL_USER2`, … | When login needed | Multiple accounts in order; **same password** as `CONTACTOUT_PASSWORD` for all. On **HTTP 429**, the bot switches to the **next** email and clears session before signing in again |
+| `EMAIL_USER1`, `EMAIL_USER2`, … | When login needed | Multiple accounts in order; **same password** as `CONTACTOUT_PASSWORD` for all. On **HTTP 429**, the bot switches to the **next** email, puts the current one on cooldown, and clears session before signing in again |
 | `EMAIL_USERS` | When login needed | Comma- or newline-separated list (instead of numbered `EMAIL_USER*` vars) |
 | `CONTACTOUT_PASSWORD` | When login needed | Password shared by all accounts in the pool |
+| `EMAIL_429_COOLDOWN_HOURS` | No | Hours to keep a login email on cooldown after **HTTP 429** before it can be reused again; default `24`. Cooldowns are persisted per worker slot under `ref/email-cooldowns/` |
 | `CONTACTOUT_LOCATION` | No | Optional explicit location override used to build the default search URL as `?location=…` |
 | `CONTACTOUT_SEARCH_URL` | No | Full dashboard search URL. Any `page=` is removed; the bot sets `page`. If set, overrides **`SEARCH_PROFILE`** and **`SEARCH_RANDOM`** |
 | `SEARCH_KEYWORDS_PATH` | No | Path to **`data/search_keywords.json`** (default: that path). Contains **`search_params`** (`pools`, `presets`, `default_extra`) plus legacy **`saved_searches`** |
@@ -88,7 +89,7 @@ By default the browser window is visible. Set `HEADLESS=1` to run headless. **Pe
 | `PROXY_HEALTH_MAX_TRIES` | No | How many proxies to try when looking for a live one (default `min(200, list length)`) |
 | `PROXY_HEALTH_IGNORE_TLS` | No | Set `1` if health checks fail on bad TLS intercept proxies |
 
-With any proxy env set, the bot uses **`chromium.launch()`** (not the persistent profile) and saves the session to **`playwright-user-data/storage-state.json`** so logins survive restarts. On **429**, it waits, switches to the **next** proxy if you configured **more than one**, and if you configured **more than one email**, it advances to the **next** account (same password) after clearing cookies / storage as needed.
+With any proxy env set, the bot uses **`chromium.launch()`** (not the persistent profile) and saves the session to **`playwright-user-data/storage-state.json`** so logins survive restarts. On **429**, it waits, switches to the **next** proxy if you configured **more than one**, and if you configured **more than one email**, it advances to the **next** account (same password) after clearing cookies / storage as needed. The rate-limited email is kept on a persisted cooldown and becomes available again after **`EMAIL_429_COOLDOWN_HOURS`**.
 
 Example `.env`:
 
