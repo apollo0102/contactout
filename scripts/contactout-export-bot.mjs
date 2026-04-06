@@ -7,11 +7,13 @@
  * No Chrome extension required — Playwright evaluates the scrape bundle in-page.
  *
  * Env (see .env):
- *   Account config — default ./ref/emails.js exporting EMAIL_USER_LIST and
+ *   Account config — default ./ref/emailList.js exporting EMAIL_LIST / EMAIL_FIRST_LIST /
+ *     EMAIL_SECOND_LIST / EMAIL_THIRD_LIST where each item can be `email:password`
+ *   Legacy account config — ./ref/emails.js exporting EMAIL_USER_LIST and
  *     CONTACTOUT_PASSWORD (shared password for all accounts)
- *   CONTACTOUT_PASSWORD — fallback when account config file is absent
- *   EMAIL_USER — fallback one account; or EMAIL_USER1, EMAIL_USER2, … (same password for all)
- *   EMAIL_USERS — fallback comma/newline list alternative to numbered vars
+ *   CONTACTOUT_PASSWORD — fallback shared password when account entries do not include one
+ *   EMAIL_USER — fallback one account; or EMAIL_USER1, EMAIL_USER2, … (`email[:password]`)
+ *   EMAIL_USERS — fallback comma/newline list alternative to numbered vars (`email[:password]`)
  *   On HTTP 429 with multiple emails, the bot advances to the next email, puts the
  *     current email on cooldown, and clears session (cookies + storage-state when
  *     using proxies) before re-login.
@@ -604,6 +606,41 @@ function parseEmailPoolFromEnv() {
   return [];
 }
 
+function parseAccountEntry(rawEntry, fallbackPassword = "") {
+  const raw = String(rawEntry ?? "").trim();
+  if (!raw) return null;
+
+  const separatorIndex = raw.indexOf(":");
+  const email =
+    separatorIndex >= 0 ? raw.slice(0, separatorIndex).trim() : raw;
+  const inlinePassword =
+    separatorIndex >= 0 ? raw.slice(separatorIndex + 1).trim() : "";
+  const password = String(inlinePassword || fallbackPassword || "").trim();
+
+  if (!email) return null;
+  return {
+    rawEntry: raw,
+    email,
+    password,
+  };
+}
+
+function normalizeAccountPool(rawEntries, fallbackPassword = "") {
+  const seenEmails = new Set();
+  const accounts = [];
+
+  for (const rawEntry of Array.isArray(rawEntries) ? rawEntries : []) {
+    const parsed = parseAccountEntry(rawEntry, fallbackPassword);
+    if (!parsed) continue;
+    const normalizedEmail = parsed.email.toLowerCase();
+    if (seenEmails.has(normalizedEmail)) continue;
+    seenEmails.add(normalizedEmail);
+    accounts.push(parsed);
+  }
+
+  return accounts;
+}
+
 async function loadAccountsConfig(options = {}) {
   const workerSlot = normalizeWorkerSlot(
     options.workerSlot ?? process.env.CONTACTOUT_WORKER_SLOT
@@ -613,45 +650,55 @@ async function loadAccountsConfig(options = {}) {
       fresh: Boolean(options.fresh),
       workerSlot,
     });
-    const emailPool = [...new Set(config.emailPool.map((s) => String(s).trim()).filter(Boolean))];
-    const password = String(config.password || "").trim();
-    if (!emailPool.length) {
+    const accountPool = normalizeAccountPool(
+      config.emailPool,
+      String(config.password || "").trim()
+    );
+    if (!accountPool.length) {
       throw new Error(
         `Account config file is missing login emails${workerSlot ? ` for worker slot ${workerSlot}` : ""}: ${EMAILS_CONFIG_PATH}`
       );
     }
-    if (!password) {
+    const accountMissingPassword = accountPool.find(
+      (account) => !String(account.password || "").trim()
+    );
+    if (accountMissingPassword) {
       throw new Error(
-        `Account config file is missing CONTACTOUT_PASSWORD: ${EMAILS_CONFIG_PATH}`
+        `Account config file is missing a password for ${accountMissingPassword.email}: ${EMAILS_CONFIG_PATH}`
       );
     }
     return {
-      emailPool,
-      password,
+      accountPool,
+      emailPool: accountPool.map((account) => account.email),
       source: EMAILS_CONFIG_PATH,
       workerSlot,
       bindingName: config.bindingName,
     };
   }
 
-  const emailPool = parseEmailPoolFromEnv();
-  const password = process.env.CONTACTOUT_PASSWORD?.trim() || "";
-  if (!emailPool.length) {
+  const accountPool = normalizeAccountPool(
+    parseEmailPoolFromEnv(),
+    process.env.CONTACTOUT_PASSWORD?.trim() || ""
+  );
+  if (!accountPool.length) {
     throw new Error(
       `No login email: create ${EMAILS_CONFIG_PATH} or set EMAIL_USER, EMAIL_USERS, or EMAIL_USER1, EMAIL_USER2, …`
     );
   }
-  if (!password) {
+  const accountMissingPassword = accountPool.find(
+    (account) => !String(account.password || "").trim()
+  );
+  if (accountMissingPassword) {
     throw new Error(
-      `No login password: create ${EMAILS_CONFIG_PATH} or set CONTACTOUT_PASSWORD`
+      `No login password for ${accountMissingPassword.email}: create ${EMAILS_CONFIG_PATH}, use email:password entries, or set CONTACTOUT_PASSWORD`
     );
   }
   return {
-    emailPool,
-    password,
+    accountPool,
+    emailPool: accountPool.map((account) => account.email),
     source: "environment variables",
     workerSlot,
-    bindingName: "EMAIL_USER_LIST",
+    bindingName: "EMAIL_LIST",
   };
 }
 
@@ -1787,6 +1834,188 @@ function envHeadless() {
   return h === "1" || h === "true" || h === "yes";
 }
 
+function isMicrosoftLoginUrl(urlString) {
+  try {
+    const host = new URL(urlString).hostname.toLowerCase();
+    return (
+      host.includes("microsoftonline.com") ||
+      host.includes("live.com") ||
+      host.includes("office.com")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function findMicrosoftLoginPage(context) {
+  if (!context) return null;
+  for (const candidate of context.pages()) {
+    if (!candidate || candidate.isClosed()) continue;
+    if (isMicrosoftLoginUrl(candidate.url())) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function waitForFirstVisibleLocator(candidates, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    for (const locator of candidates) {
+      if (!locator) continue;
+      const matchCount = await locator.count().catch(() => 0);
+      if (matchCount <= 0) continue;
+      for (let index = 0; index < matchCount; index += 1) {
+        const candidate = locator.nth(index);
+        if (await candidate.isVisible().catch(() => false)) {
+          return candidate;
+        }
+      }
+    }
+    await sleep(200);
+  }
+  return null;
+}
+
+async function clickFirstVisibleLocator(candidates, timeoutMs = 5_000) {
+  const locator = await waitForFirstVisibleLocator(candidates, timeoutMs);
+  if (!locator) return false;
+  await locator.click();
+  return true;
+}
+
+async function findMicrosoftStepPage(context, locatorFactory, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    for (const candidate of context.pages()) {
+      if (!candidate || candidate.isClosed()) continue;
+      if (!isMicrosoftLoginUrl(candidate.url())) continue;
+      const locator = await waitForFirstVisibleLocator(
+        locatorFactory(candidate),
+        300
+      );
+      if (locator) {
+        await candidate.bringToFront().catch(() => {});
+        return {
+          page: candidate,
+          locator,
+        };
+      }
+    }
+    await sleep(250);
+  }
+  return null;
+}
+
+async function completeMicrosoftSocialLogin(authPage, email, password) {
+  const normalizedEmail = String(email || "").trim();
+  const normalizedPassword = String(password || "");
+  const context = authPage.context();
+
+  const emailStep = await findMicrosoftStepPage(
+    context,
+    (candidate) => [
+      candidate.locator("#i0116"),
+      candidate.locator('input[name="loginfmt"]:not([aria-hidden="true"])'),
+    ],
+    30_000
+  );
+  if (!emailStep) {
+    throw new Error(
+      `Microsoft login did not show the email step for ${normalizedEmail}.`
+    );
+  }
+  authPage = emailStep.page;
+  await emailStep.locator.fill(normalizedEmail);
+  const emailNextClicked = await clickFirstVisibleLocator(
+    [
+      authPage.locator("#idSIButton9"),
+      authPage.getByRole("button", { name: /^next$/i }),
+      authPage.locator('input[type="submit"]'),
+    ],
+    10_000
+  );
+  if (!emailNextClicked) {
+    throw new Error("Microsoft login did not show the Next button on the email page.");
+  }
+
+  const passwordStep = await findMicrosoftStepPage(
+    context,
+    (candidate) => [
+      candidate.locator('#i0118:not(.moveOffScreen):not([aria-hidden="true"])'),
+      candidate.locator(
+        'input[name="passwd"]:not(.moveOffScreen):not([aria-hidden="true"])'
+      ),
+    ],
+    30_000
+  );
+  if (!passwordStep) {
+    throw new Error(
+      `Microsoft login did not reach the password step for ${normalizedEmail}.`
+    );
+  }
+  authPage = passwordStep.page;
+  await passwordStep.locator.fill(normalizedPassword);
+  const passwordNextClicked = await clickFirstVisibleLocator(
+    [
+      authPage.locator("#idSIButton9"),
+      authPage.getByRole("button", { name: /^(next|sign in)$/i }),
+      authPage.locator('input[type="submit"]'),
+    ],
+    10_000
+  );
+  if (!passwordNextClicked) {
+    throw new Error(
+      "Microsoft login did not show the submit button on the password page."
+    );
+  }
+
+  const staySignedInStep = await findMicrosoftStepPage(
+    context,
+    (candidate) => [
+      candidate.locator("#idBtn_Back"),
+      candidate.getByRole("button", { name: /^no$/i }),
+      candidate.getByRole("button", { name: /^yes$/i }),
+      candidate.locator("#idSIButton9"),
+    ],
+    10_000
+  );
+  if (staySignedInStep) {
+    authPage = staySignedInStep.page;
+    const handledStaySignedIn = await clickFirstVisibleLocator(
+      [
+        authPage.locator("#idBtn_Back"),
+        authPage.getByRole("button", { name: /^no$/i }),
+        authPage.getByRole("button", { name: /^yes$/i }),
+        authPage.locator("#idSIButton9"),
+      ],
+      5_000
+    );
+    if (!handledStaySignedIn) {
+      throw new Error("Microsoft login reached Stay signed in? but no button was clickable.");
+    }
+  }
+}
+
+async function waitForContactOutPage(pages, timeoutMs = 120_000) {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() <= deadline) {
+    for (const candidate of pages) {
+      if (!candidate) continue;
+      if (candidate.isClosed()) continue;
+      const url = candidate.url();
+      if (url.includes("contactout.com") && !pathnameLooksLikeLogin(url)) {
+        await candidate.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
+        return candidate;
+      }
+    }
+    await sleep(250);
+  }
+
+  return null;
+}
+
 async function login(page, email, password) {
   if (!email || !String(email).trim()) {
     throw new Error("Missing login email");
@@ -1801,28 +2030,69 @@ async function login(page, email, password) {
     });
   }
 
-  const emailInput = page.locator('input[type="email"], input[name="email"], input#email').first();
-  const passInput = page.locator('input[type="password"]').first();
-  await emailInput.waitFor({ state: "visible", timeout: 30_000 });
-  await emailInput.fill(String(email).trim());
-  await passInput.fill(password);
+  const microsoftButton = await waitForFirstVisibleLocator(
+    [
+      page.getByRole("button", { name: /sign in with microsoft outlook/i }).first(),
+      page.getByRole("link", { name: /sign in with microsoft outlook/i }).first(),
+      page.locator('button:has-text("Sign in with Microsoft Outlook")').first(),
+      page.locator('a:has-text("Sign in with Microsoft Outlook")').first(),
+    ],
+    30_000
+  );
+  if (!microsoftButton) {
+    throw new Error("ContactOut login page did not show the Microsoft Outlook sign-in button.");
+  }
 
-  const submit = page
-    .getByRole("button", { name: /^login$/i })
-    .or(page.locator('button[type="submit"]'))
-    .first();
-  await submit.click();
+  const microsoftAuthUrl = await microsoftButton
+    .evaluate((node) => {
+      const element = node instanceof HTMLElement ? node : null;
+      const anchor =
+        element instanceof HTMLAnchorElement
+          ? element
+          : element?.closest("a");
+      return anchor?.href || "";
+    })
+    .catch(() => "");
 
-  await page
-    .waitForURL(
-      (url) =>
-        url.hostname.includes("contactout.com") &&
-        !url.pathname.toLowerCase().includes("/login"),
-      { timeout: 120_000 }
-    )
-    .catch(() => {});
+  /** @type {import("playwright").Page} */
+  let authPage = page;
 
-  await page.waitForLoadState("networkidle", { timeout: 60_000 }).catch(() => {});
+  if (microsoftAuthUrl && isMicrosoftLoginUrl(microsoftAuthUrl)) {
+    await page.goto(microsoftAuthUrl, { waitUntil: "domcontentloaded" });
+  } else {
+    const popupPromise = page.context()
+      .waitForEvent("page", { timeout: 5_000 })
+      .catch(() => null);
+    await microsoftButton.click();
+
+    const popupPage = await popupPromise;
+    if (popupPage) {
+      authPage = popupPage;
+      await authPage
+        .waitForLoadState("domcontentloaded", { timeout: 30_000 })
+        .catch(() => {});
+      await authPage.bringToFront().catch(() => {});
+    } else {
+      if (!isMicrosoftLoginUrl(page.url())) {
+        await page
+          .waitForURL((url) => isMicrosoftLoginUrl(url.toString()), {
+            timeout: 30_000,
+          })
+          .catch(() => {});
+      }
+      authPage = page;
+    }
+  }
+
+  await completeMicrosoftSocialLogin(authPage, email, password);
+  const landingPage = await waitForContactOutPage(
+    [page, authPage, ...authPage.context().pages()],
+    120_000
+  );
+  if (!landingPage) {
+    throw new Error(`Microsoft social login did not return to ContactOut for ${String(email).trim()}.`);
+  }
+  return landingPage;
 }
 
 async function setLocationUnitedStates(page, locationLabel) {
@@ -2035,7 +2305,9 @@ async function resolveRoleWorkerSlots(maxBrowserCount) {
     const emailConfig = await loadEmailConfig({ fresh: true, workerSlot: slot });
     const proxyConfig = await loadProxyConfig({ fresh: true, workerSlot: slot });
     if (!emailConfig.emailPool.length) {
-      throw new Error(`Missing login emails for ${workerSlotDisplay(slot)} in ref/emails.js.`);
+      throw new Error(
+        `Missing login emails for ${workerSlotDisplay(slot)} in ${path.relative(ROOT, EMAILS_CONFIG_PATH)}.`
+      );
     }
     if (!proxyConfig.proxyLines.length) {
       throw new Error(`Missing proxies for ${workerSlotDisplay(slot)} in ref/proxies.js.`);
@@ -2274,8 +2546,7 @@ async function main() {
   }
 
   const accountConfig = await loadAccountsConfig({ workerSlot });
-  const emailPool = accountConfig.emailPool;
-  let accountPassword = accountConfig.password;
+  const accountPool = accountConfig.accountPool;
   const accountConfigSource = accountConfig.source;
   const canEditAccountConfig = accountConfigSource === EMAILS_CONFIG_PATH;
   const accountConfigBindingName = accountConfig.bindingName;
@@ -2316,11 +2587,11 @@ async function main() {
     emailCooldownStatePath,
     persistedEmailCooldownsByEmail
   );
-  let accountStates = emailPool.map((email, index) => ({
+  let accountStates = accountPool.map((account, index) => ({
+    ...account,
     index,
-    email,
     activatedAt: 0,
-    cooldownUntil: getPersistedEmailCooldownUntil(email),
+    cooldownUntil: getPersistedEmailCooldownUntil(account.email),
     successfulPages: 0,
   }));
   let activeAccountIndex = 0;
@@ -2337,6 +2608,7 @@ async function main() {
     return accountStates[safeIndex];
   };
   const currentEmail = () => currentAccount().email;
+  const currentPassword = () => currentAccount().password;
   function reloadPersistedEmailCooldowns() {
     persistedEmailCooldownsByEmail = loadPersistedEmailCooldowns(
       emailCooldownStatePath
@@ -2395,7 +2667,7 @@ async function main() {
     );
   }
   console.log(
-    `[auth] ${emailPool.length} account(s)${workerSlot ? ` for ${workerSlotDisplay(workerSlot)}` : ""}; rotate after ${accountRotateSuccessPages} successful pages, cooldown ${Math.round(accountCooldownMs / 60000)} minute(s), 429 cooldown ${email429CooldownHours} hour(s)`
+    `[auth] ${accountPool.length} account(s)${workerSlot ? ` for ${workerSlotDisplay(workerSlot)}` : ""}; rotate after ${accountRotateSuccessPages} successful pages, cooldown ${Math.round(accountCooldownMs / 60000)} minute(s), 429 cooldown ${email429CooldownHours} hour(s)`
   );
 
   let history = loadSearchHistory(historyPath);
@@ -2476,6 +2748,7 @@ async function main() {
     );
   };
   const storageStatePath = path.join(userDataDir, "storage-state.json");
+  const sessionAccountStatePath = path.join(userDataDir, "session-account.json");
   fs.mkdirSync(userDataDir, { recursive: true });
   const backoff429 =
     parseInt(process.env.PROXY_429_BACKOFF_MS || "60000", 10) || 60000;
@@ -2801,6 +3074,116 @@ async function main() {
   let loggedIn = false;
   let pagesSinceRotate = 0;
 
+  function normalizeEmailIdentity(value) {
+    return String(value || "").trim().toLowerCase();
+  }
+
+  function loadStoredSessionAccountEmail() {
+    try {
+      const raw = JSON.parse(fs.readFileSync(sessionAccountStatePath, "utf8"));
+      return normalizeEmailIdentity(raw?.email);
+    } catch {
+      return "";
+    }
+  }
+
+  function saveStoredSessionAccountEmail(email) {
+    const normalized = normalizeEmailIdentity(email);
+    if (!normalized) return;
+    fs.mkdirSync(path.dirname(sessionAccountStatePath), { recursive: true });
+    fs.writeFileSync(
+      sessionAccountStatePath,
+      JSON.stringify(
+        {
+          email: normalized,
+          updatedAt: new Date().toISOString(),
+        },
+        null,
+        2
+      ) + "\n",
+      "utf8"
+    );
+  }
+
+  function clearStoredSessionAccountEmail() {
+    try {
+      if (fs.existsSync(sessionAccountStatePath)) {
+        fs.unlinkSync(sessionAccountStatePath);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function hasPersistedSessionArtifacts() {
+    if (rotator) {
+      return (
+        fs.existsSync(storageStatePath) || fs.existsSync(sessionAccountStatePath)
+      );
+    }
+
+    try {
+      const entries = fs
+        .readdirSync(userDataDir)
+        .filter((name) => name !== path.basename(sessionAccountStatePath));
+      return entries.length > 0 || fs.existsSync(sessionAccountStatePath);
+    } catch {
+      return fs.existsSync(sessionAccountStatePath);
+    }
+  }
+
+  function describeStoredSessionForAccount(email) {
+    const targetEmail = normalizeEmailIdentity(email);
+    const storedEmail = loadStoredSessionAccountEmail();
+    const hasArtifacts = hasPersistedSessionArtifacts();
+
+    if (!hasArtifacts) {
+      return {
+        targetEmail,
+        storedEmail,
+        hasArtifacts: false,
+        shouldClear: false,
+        canReuse: false,
+        reason: "no persisted session",
+      };
+    }
+
+    if (!storedEmail) {
+      return {
+        targetEmail,
+        storedEmail,
+        hasArtifacts: true,
+        shouldClear: true,
+        canReuse: false,
+        reason: "persisted session exists without account metadata",
+      };
+    }
+
+    if (storedEmail !== targetEmail) {
+      return {
+        targetEmail,
+        storedEmail,
+        hasArtifacts: true,
+        shouldClear: true,
+        canReuse: false,
+        reason: `stored session belongs to ${storedEmail}`,
+      };
+    }
+
+    return {
+      targetEmail,
+      storedEmail,
+      hasArtifacts: true,
+      shouldClear: false,
+      canReuse: true,
+      reason: `stored session matches ${storedEmail}`,
+    };
+  }
+
+  function rememberCurrentAccountSession() {
+    saveStoredSessionAccountEmail(currentEmail());
+  }
+
   async function persistSession() {
     if (!rotator || !context) return;
     try {
@@ -2826,14 +3209,14 @@ async function main() {
     const previousByEmail = new Map(
       accountStates.map((state) => [state.email.toLowerCase(), state])
     );
-    const nextStates = freshConfig.emailPool.map((email, index) => {
-      const existing = previousByEmail.get(String(email).toLowerCase());
-      const persistedCooldownUntil = getPersistedEmailCooldownUntil(email);
+    const nextStates = freshConfig.accountPool.map((account, index) => {
+      const existing = previousByEmail.get(String(account.email).toLowerCase());
+      const persistedCooldownUntil = getPersistedEmailCooldownUntil(account.email);
       if (existing) {
         return {
           ...existing,
+          ...account,
           index,
-          email,
           cooldownUntil: Math.max(
             existing.cooldownUntil || 0,
             persistedCooldownUntil
@@ -2841,15 +3224,14 @@ async function main() {
         };
       }
       return {
+        ...account,
         index,
-        email,
         activatedAt: 0,
         cooldownUntil: persistedCooldownUntil,
         successfulPages: 0,
       };
     });
     accountStates = nextStates;
-    accountPassword = freshConfig.password;
 
     if (!accountStates.length) {
       throw new Error(
@@ -2895,14 +3277,14 @@ async function main() {
       fresh: true,
       workerSlot,
     });
-    const nextPool = freshConfig.emailPool.filter(
-      (item) => String(item).trim().toLowerCase() !== normalized
+    const nextPool = freshConfig.accountPool.filter(
+      (item) => String(item.email).trim().toLowerCase() !== normalized
     );
-    if (nextPool.length === freshConfig.emailPool.length) {
+    if (nextPool.length === freshConfig.accountPool.length) {
       return false;
     }
 
-    saveEmailPoolToConfigFile(nextPool, {
+    saveEmailPoolToConfigFile(nextPool.map((item) => item.rawEntry), {
       workerSlot,
       bindingName: accountConfigBindingName,
     });
@@ -3011,6 +3393,7 @@ async function main() {
       } catch {
         /* ignore */
       }
+      clearStoredSessionAccountEmail();
     }
 
     await context?.close().catch(() => {});
@@ -3040,6 +3423,7 @@ async function main() {
           /* ignore */
         }
         fs.mkdirSync(userDataDir, { recursive: true });
+        clearStoredSessionAccountEmail();
         console.log("[auth] Cleared persistent browser profile (fresh session).");
       }
       context = await chromium.launchPersistentContext(userDataDir, {
@@ -3600,6 +3984,36 @@ async function main() {
     console.log(
       `[contactout-bot] Starting search${plan.role ? ` (role=${plan.role})` : ""}${plan.gender ? ` (gender=${plan.gender})` : ""}: ${searchBaseUrl}`
     );
+
+    if (!loggedIn) {
+      const storedSession = describeStoredSessionForAccount(currentEmail());
+      if (storedSession.shouldClear) {
+        console.log(
+          `[auth] Clearing saved browser session before login: ${storedSession.reason}.`
+        );
+        await recreateProxyContext(`session reset for ${currentEmail()}`, {
+          clearSession: true,
+          advanceProxy: false,
+        });
+      }
+
+      if (storedSession.canReuse) {
+        console.log(
+          `[auth] Reusing saved browser session for ${currentEmail()}.`
+        );
+      } else {
+        await gotoWith429Retry(
+          "https://contactout.com/login",
+          `contactout login page${plan.role ? ` role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}`
+        );
+        console.log("[contactout-bot] Signing in from https://contactout.com/login…");
+        page = await login(page, currentEmail(), currentPassword());
+        rememberCurrentAccountSession();
+        loggedIn = true;
+        if (rotator) await persistSession();
+      }
+    }
+
     await gotoWith429Retry(
       entryUrl,
       `${canResumeDirectly ? `resume page=${resumePage}` : "first search page"}${plan.role ? ` role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}`
@@ -3607,7 +4021,8 @@ async function main() {
 
     if (pathnameLooksLikeLogin(page.url())) {
       console.log("[contactout-bot] Not logged in; signing inвЂ¦");
-      await login(page, currentEmail(), accountPassword);
+      page = await login(page, currentEmail(), currentPassword());
+      rememberCurrentAccountSession();
       await gotoWith429Retry(
         entryUrl,
         canResumeDirectly ? `after login resume page=${resumePage}` : "after login"
@@ -3637,7 +4052,8 @@ async function main() {
           `first search page retry${plan.role ? ` role=${plan.role}` : ""}${plan.gender ? ` gender=${plan.gender}` : ""}`
         );
         if (pathnameLooksLikeLogin(page.url())) {
-          await login(page, currentEmail(), accountPassword);
+          page = await login(page, currentEmail(), currentPassword());
+          rememberCurrentAccountSession();
           await gotoWith429Retry(firstUrl, "after re-login first search page");
           if (rotator) await persistSession();
         }
@@ -3892,7 +4308,8 @@ async function main() {
         console.log(
           "[contactout-bot] On login page (e.g. after 429 session reset); signing in againвЂ¦"
         );
-        await login(page, currentEmail(), accountPassword);
+        page = await login(page, currentEmail(), currentPassword());
+        rememberCurrentAccountSession();
         await gotoWith429Retry(urlThis, `after re-login page=${pageNum}`);
         if (rotator) await persistSession();
       }

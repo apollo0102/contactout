@@ -5,7 +5,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export const ROOT = path.resolve(__dirname, "..");
-export const EMAILS_CONFIG_PATH = path.join(ROOT, "ref", "emails.js");
+export const EMAIL_LISTS_CONFIG_PATH = path.join(ROOT, "ref", "emailList.js");
+export const LEGACY_EMAILS_CONFIG_PATH = path.join(ROOT, "ref", "emails.js");
+export const EMAILS_CONFIG_PATH = fs.existsSync(EMAIL_LISTS_CONFIG_PATH)
+  ? EMAIL_LISTS_CONFIG_PATH
+  : LEGACY_EMAILS_CONFIG_PATH;
 export const PROXIES_CONFIG_PATH = path.join(ROOT, "ref", "proxies.js");
 export const LEGACY_PROXIES_FILE_PATH = path.join(ROOT, "ref", "proxies.txt");
 export const WORKER_GENDERS = ["male", "female", "unknown"];
@@ -75,13 +79,13 @@ function readFirstArrayBinding(mod, bindingNames) {
 function emailBindingNamesForSlot(slot) {
   switch (normalizeWorkerSlot(slot)) {
     case 1:
-      return ["EMAIL_USER_FIRST_LIST"];
+      return ["EMAIL_FIRST_LIST", "EMAIL_USER_FIRST_LIST"];
     case 2:
-      return ["EMAIL_USER_SECOND_LIST"];
+      return ["EMAIL_SECOND_LIST", "EMAIL_USER_SECOND_LIST"];
     case 3:
-      return ["EMAIL_USER_THIRD_LIST"];
+      return ["EMAIL_THIRD_LIST", "EMAIL_USER_THIRD_LIST"];
     default:
-      return ["EMAIL_USER_LIST"];
+      return ["EMAIL_LIST", "EMAIL_USER_LIST"];
   }
 }
 
@@ -147,10 +151,10 @@ export async function inspectEmailPools(options = {}) {
     };
   }
 
-  const generic = normalizeStringList(mod.EMAIL_USER_LIST);
-  const first = readFirstArrayBinding(mod, emailBindingNamesForSlot(1)).values;
-  const second = readFirstArrayBinding(mod, emailBindingNamesForSlot(2)).values;
-  const third = readFirstArrayBinding(mod, emailBindingNamesForSlot(3)).values;
+  const genericInfo = readFirstArrayBinding(mod, emailBindingNamesForSlot(0));
+  const firstInfo = readFirstArrayBinding(mod, emailBindingNamesForSlot(1));
+  const secondInfo = readFirstArrayBinding(mod, emailBindingNamesForSlot(2));
+  const thirdInfo = readFirstArrayBinding(mod, emailBindingNamesForSlot(3));
   const password =
     typeof mod.CONTACTOUT_PASSWORD === "string"
       ? mod.CONTACTOUT_PASSWORD.trim()
@@ -159,12 +163,18 @@ export async function inspectEmailPools(options = {}) {
   return {
     source: EMAILS_CONFIG_PATH,
     password,
-    generic,
-    first,
-    second,
-    third,
+    generic: genericInfo.values,
+    genericBindingName: genericInfo.bindingName,
+    first: firstInfo.values,
+    firstBindingName: firstInfo.bindingName,
+    second: secondInfo.values,
+    secondBindingName: secondInfo.bindingName,
+    third: thirdInfo.values,
+    thirdBindingName: thirdInfo.bindingName,
     hasGenderSpecific: false,
-    hasSlotSpecific: Boolean(first.length || second.length || third.length),
+    hasSlotSpecific: Boolean(
+      firstInfo.values.length || secondInfo.values.length || thirdInfo.values.length
+    ),
   };
 }
 
@@ -177,7 +187,7 @@ export async function loadEmailConfig(options = {}) {
       emailPool: [],
       password: "",
       source: "",
-      bindingName: "EMAIL_USER_LIST",
+      bindingName: "EMAIL_LIST",
       workerSlot,
       workerGender: "",
       hasGenderSpecific: false,
@@ -216,10 +226,10 @@ export async function loadEmailConfig(options = {}) {
     password: info.password,
     source: EMAILS_CONFIG_PATH,
     bindingName: info.generic.length
-      ? "EMAIL_USER_LIST"
+      ? info.genericBindingName
       : info.first.length
-        ? "EMAIL_USER_FIRST_LIST"
-        : "EMAIL_USER_LIST",
+        ? info.firstBindingName
+        : emailBindingNamesForSlot(0)[0],
     workerSlot: 0,
     workerGender: "",
     hasGenderSpecific: info.hasGenderSpecific,
@@ -232,12 +242,12 @@ export function saveEmailPoolToConfigFile(emailPool, options = {}) {
   const bindingName =
     options.bindingName ||
     (workerSlot ? emailBindingNamesForSlot(workerSlot)[0] : "") ||
-    "EMAIL_USER_LIST";
+    "EMAIL_LIST";
   const bindingCandidates = options.bindingName
     ? [options.bindingName]
     : workerSlot
       ? emailBindingNamesForSlot(workerSlot)
-      : ["EMAIL_USER_LIST"];
+      : emailBindingNamesForSlot(0);
 
   const raw = fs.readFileSync(EMAILS_CONFIG_PATH, "utf8");
   let next = raw;
