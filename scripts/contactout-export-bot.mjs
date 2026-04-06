@@ -23,7 +23,8 @@
  *   START_PAGE — first `page=` in the URL (default 1)
  *   MAX_PAGES — how many pages to export (default 10). `0` = keep incrementing `page` until a scrape returns 0 rows
  *   EXPORT_DIR — default ./exports
- *   SEARCH_HISTORY_PATH — default ./ref/search-history.json (tracks completed pages per search)
+ *   SEARCH_HISTORY_PATH — default ./ref/search-history/search-history-slot-1.json
+ *     (tracks completed pages per search; worker slots use their matching slot file)
  *   IGNORE_SEARCH_HISTORY — set "1" to re-download every page
  *   MERGE_JSON — set "0" to skip writing one combined JSON file at the end of a run
  *   MERGE_CSV — legacy alias for MERGE_JSON
@@ -1878,10 +1879,7 @@ function workerSlotDisplay(workerSlot = 0) {
 }
 
 function defaultHistoryPathForWorker(rootDir, workerSlot = 0) {
-  const normalized = normalizeWorkerSlot(workerSlot);
-  if (!normalized) {
-    return path.join(rootDir, "ref", "search-history.json");
-  }
+  const normalized = normalizeWorkerSlot(workerSlot) || 1;
   return path.join(
     rootDir,
     "ref",
