@@ -6,7 +6,6 @@ node_modules/
 playwright-user-data/
 exports/
 data/
-# ref/search-history.json
 ref/search-history/
 ref/email-cooldowns.json
 ref/email-cooldowns/
