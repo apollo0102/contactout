@@ -240,7 +240,7 @@ const BANNED_WEBSITE_DOMAIN=
 "dispostable.com", "fakemail.net", "inboxkitten.com", "minutemail.com"
 ]
 
-const MAX_BROWSER_COUNT=1
+const MAX_BROWSER_COUNT=3
 const WORKER_DEAD_SLOT_LOG_INTERVAL_MS = 30000
 
 export default {

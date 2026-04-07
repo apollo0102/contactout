@@ -9,8 +9,6 @@
  * Env (see .env):
  *   Account config — default ./ref/emailList.js exporting EMAIL_LIST / EMAIL_FIRST_LIST /
  *     EMAIL_SECOND_LIST / EMAIL_THIRD_LIST where each item can be `email:password`
- *   Legacy account config — ./ref/emails.js exporting EMAIL_USER_LIST and
- *     CONTACTOUT_PASSWORD (shared password for all accounts)
  *   CONTACTOUT_PASSWORD — fallback shared password when account entries do not include one
  *   EMAIL_USER — fallback one account; or EMAIL_USER1, EMAIL_USER2, … (`email[:password]`)
  *   EMAIL_USERS — fallback comma/newline list alternative to numbered vars (`email[:password]`)
@@ -1877,11 +1875,372 @@ async function waitForFirstVisibleLocator(candidates, timeoutMs = 10_000) {
   return null;
 }
 
+async function waitForFirstMatchingVisibleLocator(
+  candidates,
+  matcher,
+  timeoutMs = 10_000
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    for (const locator of candidates) {
+      if (!locator) continue;
+      const matchCount = await locator.count().catch(() => 0);
+      if (matchCount <= 0) continue;
+      for (let index = 0; index < matchCount; index += 1) {
+        const candidate = locator.nth(index);
+        if (!(await candidate.isVisible().catch(() => false))) continue;
+        const matched = await matcher(candidate).catch(() => false);
+        if (matched) {
+          return candidate;
+        }
+      }
+    }
+    await sleep(200);
+  }
+  return null;
+}
+
 async function clickFirstVisibleLocator(candidates, timeoutMs = 5_000) {
   const locator = await waitForFirstVisibleLocator(candidates, timeoutMs);
   if (!locator) return false;
-  await locator.click();
-  return true;
+  return clickLocatorRobust(locator);
+}
+
+async function clickLocatorRobust(locator) {
+  if (!locator) return false;
+  try {
+    await locator.scrollIntoViewIfNeeded().catch(() => {});
+    await locator.click({ timeout: 5_000 });
+    return true;
+  } catch {
+    /* fall through */
+  }
+
+  try {
+    await locator.click({ timeout: 5_000, force: true });
+    return true;
+  } catch {
+    /* fall through */
+  }
+
+  try {
+    await locator.focus().catch(() => {});
+    await locator.press("Enter", { timeout: 2_000 });
+    return true;
+  } catch {
+    /* fall through */
+  }
+
+  try {
+    await locator.evaluate((node) => {
+      if (node instanceof HTMLElement) {
+        node.click();
+      }
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readLocatorText(locator) {
+  if (!locator) return "";
+  const text = await locator
+    .evaluate((node) => {
+      if (!(node instanceof Element)) return "";
+      const pickFirstNonEmpty = (...values) => {
+        for (const value of values) {
+          const normalized = String(value || "")
+            .replace(/\s+/g, " ")
+            .trim();
+          if (normalized) {
+            return normalized;
+          }
+        }
+        return "";
+      };
+      const inputValue =
+        node instanceof HTMLInputElement || node instanceof HTMLButtonElement
+          ? node.value || ""
+          : "";
+      const ariaDescribedBy = (node.getAttribute("aria-describedby") || "")
+        .split(/\s+/)
+        .map((value) => value.trim())
+        .filter(Boolean)
+        .map((id) => node.ownerDocument?.getElementById(id))
+        .filter(Boolean)
+        .map((element) => element?.textContent || "")
+        .join(" ");
+      const ariaLabelledBy = (node.getAttribute("aria-labelledby") || "")
+        .split(/\s+/)
+        .map((value) => value.trim())
+        .filter(Boolean)
+        .map((id) => node.ownerDocument?.getElementById(id))
+        .filter(Boolean)
+        .map((element) => element?.textContent || "")
+        .join(" ");
+      return pickFirstNonEmpty(
+        inputValue,
+        node.getAttribute("aria-label"),
+        ariaDescribedBy,
+        ariaLabelledBy,
+        (node instanceof HTMLElement ? node.innerText : ""),
+        node.textContent,
+        node.getAttribute("title")
+      );
+    })
+    .catch(() => "");
+  return String(text || "").trim();
+}
+
+async function getPreferredPageAndFrameContexts(page) {
+  const candidateFrames = [];
+  for (const frame of page.frames()) {
+    if (frame === page.mainFrame()) continue;
+    const url = frame.url();
+    const isChallengeFrame = /hsprotect|challenge|captcha|arkose/i.test(
+      url || ""
+    );
+    try {
+      const frameElement = await frame.frameElement();
+      const visibility = await frameElement.evaluate((node) => {
+        if (!(node instanceof HTMLElement)) {
+          return { visible: false, area: 0 };
+        }
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        const visible =
+          style.display !== "none" &&
+          style.visibility !== "hidden" &&
+          rect.width > 0 &&
+          rect.height > 0;
+        return {
+          visible,
+          area: rect.width * rect.height,
+        };
+      });
+      candidateFrames.push({
+        frame,
+        area: visibility.area || 0,
+        url,
+        isChallengeFrame,
+        visibilityState: visibility?.visible ? "visible" : "hidden",
+      });
+    } catch {
+      candidateFrames.push({
+        frame,
+        area: 0,
+        url,
+        isChallengeFrame,
+        visibilityState: "unknown",
+      });
+    }
+  }
+
+  candidateFrames.sort((left, right) => {
+    if (left.isChallengeFrame !== right.isChallengeFrame) {
+      return left.isChallengeFrame ? -1 : 1;
+    }
+
+    const visibilityRank = {
+      visible: 0,
+      unknown: 1,
+      hidden: 2,
+    };
+    const leftVisibility = visibilityRank[left.visibilityState] ?? 3;
+    const rightVisibility = visibilityRank[right.visibilityState] ?? 3;
+    if (leftVisibility !== rightVisibility) {
+      return leftVisibility - rightVisibility;
+    }
+    return (right.area || 0) - (left.area || 0);
+  });
+
+  const preferredFrames = candidateFrames
+    .filter((entry) => entry.visibilityState !== "hidden" || entry.isChallengeFrame)
+    .map((entry) => entry.frame);
+
+  return [...preferredFrames, page];
+}
+
+function getMicrosoftHumanProofIconCandidates(context) {
+  return [
+    context.locator('a[role="button"][aria-label="Accessible challenge"]'),
+    context.locator('a[aria-label="Accessible challenge"]'),
+    context.locator('a[tabindex="0"][aria-label*="Accessible challenge"]'),
+    context.locator('a[role="button"][aria-label*="Accessible challenge"]'),
+    context.getByRole("button", { name: /accessible challenge/i }),
+  ];
+}
+
+const MICROSOFT_HUMAN_PROOF_ACTION_LABEL_PATTERN =
+  /press\s*(?:and|&)\s*hold|press again|please to wait|please wait/i;
+const MICROSOFT_HUMAN_PROOF_PRESS_AGAIN_LABEL_PATTERN = /press again/i;
+const MICROSOFT_HUMAN_PROOF_PROGRESS_LABEL_PATTERN =
+  /please to wait|please wait|press again/i;
+const MICROSOFT_HUMAN_PROOF_RETRY_MESSAGE_PATTERN = /please try again/i;
+
+function getMicrosoftHumanProofActionCandidates(context) {
+  return [
+    context.locator('div[role="button"][aria-label="Press again"]'),
+    context.locator('[role="button"][aria-label="Press again"]'),
+    context.locator('div[role="button"][aria-label*="Human Challenge"]'),
+    context.locator('[role="button"][aria-label*="Press"]'),
+    context.locator('[role="button"][aria-label*="Wait"]'),
+    context.locator('div[role="button"][aria-label]'),
+    context.locator('div[tabindex="0"]'),
+    context.locator('[tabindex="0"]:not(a)'),
+    context.getByRole("button", {
+      name: MICROSOFT_HUMAN_PROOF_ACTION_LABEL_PATTERN,
+    }),
+    context.getByText(MICROSOFT_HUMAN_PROOF_ACTION_LABEL_PATTERN),
+    context.locator(
+      'button, [role="button"], div[role="button"], [tabindex="0"], input[type="button"], input[type="submit"]'
+    ),
+  ];
+}
+
+function getMicrosoftHumanProofPressAgainCandidates(context) {
+  return [
+    context.locator('div[role="button"][aria-label="Press again"]'),
+    context.locator('[role="button"][aria-label="Press again"]'),
+    context.getByRole("button", { name: /^press again$/i }),
+    context.getByText(/^press again$/i),
+  ];
+}
+
+async function findMicrosoftHumanProofIconControl(page, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    for (const context of await getPreferredPageAndFrameContexts(page)) {
+      const iconButton = await waitForFirstVisibleLocator(
+        getMicrosoftHumanProofIconCandidates(context),
+        300
+      );
+      if (iconButton) {
+        return {
+          context,
+          iconButton,
+        };
+      }
+    }
+    await sleep(250);
+  }
+  return null;
+}
+
+async function findMicrosoftHumanProofActionControlByLabel(
+  page,
+  pattern,
+  timeoutMs = 10_000
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    for (const context of await getPreferredPageAndFrameContexts(page)) {
+      const actionButton = await waitForFirstMatchingVisibleLocator(
+        getMicrosoftHumanProofActionCandidates(context),
+        async (candidate) => pattern.test(await readLocatorText(candidate)),
+        300
+      );
+      if (!actionButton) {
+        continue;
+      }
+
+      const actionLabel = await readLocatorText(actionButton);
+      if (pattern.test(actionLabel)) {
+        return {
+          context,
+          actionButton,
+          actionLabel,
+        };
+      }
+    }
+    await sleep(250);
+  }
+  return null;
+}
+
+async function findMicrosoftHumanProofRetryMessage(page, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    for (const context of await getPreferredPageAndFrameContexts(page)) {
+      const retryMessage = await waitForFirstVisibleLocator(
+        [
+          context.getByText(MICROSOFT_HUMAN_PROOF_RETRY_MESSAGE_PATTERN),
+          context.locator('[aria-live="assertive"]', {
+            hasText: MICROSOFT_HUMAN_PROOF_RETRY_MESSAGE_PATTERN,
+          }),
+          context.locator("p, span, div").filter({
+            hasText: MICROSOFT_HUMAN_PROOF_RETRY_MESSAGE_PATTERN,
+          }),
+        ],
+        300
+      );
+      if (retryMessage) {
+        return retryMessage;
+      }
+    }
+    await sleep(250);
+  }
+  return null;
+}
+
+async function findMicrosoftHumanProofControls(page, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    for (const context of await getPreferredPageAndFrameContexts(page)) {
+      const iconButton = await waitForFirstVisibleLocator(
+        getMicrosoftHumanProofIconCandidates(context),
+        300
+      );
+      if (!iconButton) {
+        continue;
+      }
+
+      const actionButton = await waitForFirstMatchingVisibleLocator(
+        getMicrosoftHumanProofActionCandidates(context),
+        async (candidate) =>
+          MICROSOFT_HUMAN_PROOF_ACTION_LABEL_PATTERN.test(
+            await readLocatorText(candidate)
+          ),
+        300
+      );
+      if (!actionButton) {
+        continue;
+      }
+
+      const actionLabel = await readLocatorText(actionButton);
+      if (MICROSOFT_HUMAN_PROOF_ACTION_LABEL_PATTERN.test(actionLabel)) {
+        return {
+          context,
+          iconButton,
+          actionButton,
+          actionLabel,
+        };
+      }
+    }
+    await sleep(250);
+  }
+  return null;
+}
+
+async function findMicrosoftPageByText(context, patterns, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    for (const candidate of context.pages()) {
+      if (!candidate || candidate.isClosed()) continue;
+      if (!isMicrosoftLoginUrl(candidate.url())) continue;
+      const matchedText = await waitForFirstVisibleLocator(
+        patterns.map((pattern) => candidate.getByText(pattern).first()),
+        300
+      );
+      if (matchedText) {
+        await candidate.bringToFront().catch(() => {});
+        return candidate;
+      }
+    }
+    await sleep(250);
+  }
+  return null;
 }
 
 async function findMicrosoftStepPage(context, locatorFactory, timeoutMs = 15_000) {
@@ -1907,6 +2266,811 @@ async function findMicrosoftStepPage(context, locatorFactory, timeoutMs = 15_000
   return null;
 }
 
+async function activateMicrosoftHumanProofIcon(iconButton) {
+  if (!iconButton) return false;
+
+  await iconButton.scrollIntoViewIfNeeded().catch(() => {});
+  await iconButton.focus().catch(() => {});
+
+  const activationAttempts = [
+    async () => {
+      await iconButton.press("Enter", { timeout: 2_000 });
+      return true;
+    },
+    async () => {
+      await iconButton.press("Space", { timeout: 2_000 });
+      return true;
+    },
+    async () => {
+      await iconButton.press(" ", { timeout: 2_000 });
+      return true;
+    },
+    async () => {
+      await iconButton.click({ timeout: 5_000 });
+      return true;
+    },
+    async () => {
+      await iconButton.click({ timeout: 5_000, force: true });
+      return true;
+    },
+    async () => {
+      await iconButton.evaluate((node) => {
+        if (!(node instanceof HTMLElement)) return;
+        node.focus();
+        node.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Enter", bubbles: true })
+        );
+        node.dispatchEvent(
+          new KeyboardEvent("keyup", { key: "Enter", bubbles: true })
+        );
+        node.click();
+      });
+      return true;
+    },
+  ];
+
+  for (const attempt of activationAttempts) {
+    try {
+      if (await attempt()) {
+        return true;
+      }
+    } catch {
+      /* try next activation style */
+    }
+  }
+
+  return false;
+}
+
+async function isMicrosoftHumanProofIconDisabled(iconButton) {
+  if (!iconButton) return false;
+  return iconButton
+    .evaluate((node) => {
+      if (!(node instanceof Element)) return false;
+      const ariaDisabled = (node.getAttribute("aria-disabled") || "")
+        .trim()
+        .toLowerCase();
+      const tabindex = (node.getAttribute("tabindex") || "").trim();
+      return ariaDisabled === "true" || tabindex === "-1";
+    })
+    .catch(() => false);
+}
+
+async function findMicrosoftHumanProofExactPressAgainControl(
+  page,
+  preferredContext,
+  timeoutMs = 5_000
+) {
+  const preferredContexts = await getPreferredPageAndFrameContexts(page);
+  const contexts = preferredContext
+    ? [
+        preferredContext,
+        ...preferredContexts.filter((context) => context !== preferredContext),
+      ]
+    : preferredContexts;
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    for (const context of contexts) {
+      const actionButton = await waitForFirstVisibleLocator(
+        getMicrosoftHumanProofPressAgainCandidates(context),
+        300
+      );
+      if (!actionButton) continue;
+      const actionLabel = await readLocatorText(actionButton);
+      if (MICROSOFT_HUMAN_PROOF_PRESS_AGAIN_LABEL_PATTERN.test(actionLabel)) {
+        return {
+          context,
+          actionButton,
+          actionLabel,
+        };
+      }
+    }
+    await sleep(250);
+  }
+
+  return null;
+}
+
+async function findMicrosoftHumanProofExactPressAgainState(
+  page,
+  preferredContext,
+  timeoutMs = 5_000
+) {
+  const preferredContexts = await getPreferredPageAndFrameContexts(page);
+  const contexts = preferredContext
+    ? [
+        preferredContext,
+        ...preferredContexts.filter((context) => context !== preferredContext),
+      ]
+    : preferredContexts;
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    for (const context of contexts) {
+      let disabledIcon = null;
+      for (const locator of [
+        context.locator(
+          'a[role="button"][aria-label="Accessible challenge"][aria-disabled="true"][tabindex="-1"]'
+        ),
+        context.locator(
+          'a[aria-label="Accessible challenge"][aria-disabled="true"]'
+        ),
+      ]) {
+        const count = await locator.count().catch(() => 0);
+        if (count > 0) {
+          disabledIcon = locator.first();
+          break;
+        }
+      }
+
+      let actionButton = null;
+      for (const locator of [
+        context.locator(
+          'div[role="button"][aria-label="Press again"][tabindex="0"]'
+        ),
+        context.locator('[role="button"][aria-label="Press again"]'),
+      ]) {
+        const count = await locator.count().catch(() => 0);
+        if (count > 0) {
+          actionButton = locator.first();
+          break;
+        }
+      }
+
+      if (!actionButton) {
+        actionButton = await waitForFirstMatchingVisibleLocator(
+        [
+          context.locator('div[role="button"][tabindex="0"]'),
+          context.locator('[role="button"][tabindex="0"]'),
+          context.locator('div[tabindex="0"]'),
+        ],
+        async (candidate) =>
+          MICROSOFT_HUMAN_PROOF_PRESS_AGAIN_LABEL_PATTERN.test(
+            await readLocatorText(candidate)
+          ),
+        300
+      );
+      }
+      if (!actionButton) continue;
+
+      const actionLabel = await readLocatorText(actionButton);
+      if (MICROSOFT_HUMAN_PROOF_PRESS_AGAIN_LABEL_PATTERN.test(actionLabel)) {
+        return {
+          context,
+          iconButton: disabledIcon || null,
+          actionButton,
+          actionLabel,
+        };
+      }
+    }
+    await sleep(250);
+  }
+
+  return null;
+}
+
+async function waitForMicrosoftHumanProofControlsByLabel(
+  page,
+  pattern,
+  timeoutMs = 10_000
+) {
+  return findMicrosoftHumanProofActionControlByLabel(page, pattern, timeoutMs);
+}
+
+const MICROSOFT_RECOVERY_STEP_WAIT_MS = 5_000;
+const MICROSOFT_HUMAN_PROOF_ICON_WAIT_MS = 15_000;
+const MICROSOFT_HUMAN_PROOF_MAX_ICON_ATTEMPTS = 5;
+const MICROSOFT_HUMAN_PROOF_POST_ACTION_WAIT_MS = 20_000;
+const MICROSOFT_HUMAN_PROOF_PRESS_AGAIN_SETTLE_MS = 1_500;
+const MICROSOFT_HUMAN_PROOF_PRE_PRESS_AGAIN_DEBUG_SLEEP_MS = 0;
+const MICROSOFT_HUMAN_PROOF_MAX_CYCLES = 5;
+
+function logMicrosoftPageTransition(pageName) {
+  console.log(`[auth] Moved to Microsoft page: ${pageName}`);
+}
+
+async function debugMicrosoftHumanProofFrames(page, label = "snapshot") {
+  const frames = await getPreferredPageAndFrameContexts(page);
+  console.log(
+    `[auth] Human proof frame debug (${label}): inspecting ${frames.length} frame/page context(s).`
+  );
+  for (const [index, context] of frames.entries()) {
+    try {
+      const url =
+        typeof context.url === "function" ? context.url() : page.url();
+      const iconCount = await context
+        .locator('[aria-label="Accessible challenge"]')
+        .count()
+        .catch(() => 0);
+      const exactPressAgainCount = await context
+        .locator('[role="button"][aria-label="Press again"]')
+        .count()
+        .catch(() => 0);
+      const humanChallengeButtonCount = await context
+        .locator('[role="button"][aria-label*="Human Challenge"]')
+        .count()
+        .catch(() => 0);
+      const retryMessageCount = await context
+        .getByText(MICROSOFT_HUMAN_PROOF_RETRY_MESSAGE_PATTERN)
+        .count()
+        .catch(() => 0);
+      console.log(
+        `[auth] Human proof frame[${index}] url=${url} icon=${iconCount} pressAgain=${exactPressAgainCount} humanChallengeButtons=${humanChallengeButtonCount} retryMessage=${retryMessageCount}`
+      );
+    } catch (error) {
+      console.log(
+        `[auth] Human proof frame[${index}] inspect failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+}
+
+async function waitForStableMicrosoftRecoveryPage(context, patterns) {
+  await sleep(MICROSOFT_RECOVERY_STEP_WAIT_MS);
+  return findMicrosoftPageByText(context, patterns, MICROSOFT_RECOVERY_STEP_WAIT_MS);
+}
+
+async function clickMicrosoftHumanProofPressAgain(page, actionButton) {
+  if (!actionButton) return false;
+
+  await actionButton.scrollIntoViewIfNeeded().catch(() => {});
+  await actionButton.hover({ timeout: 5_000 }).catch(() => {});
+  await sleep(MICROSOFT_HUMAN_PROOF_PRESS_AGAIN_SETTLE_MS);
+
+  const box = await actionButton.boundingBox().catch(() => null);
+  if (box) {
+    const centerX = box.x + box.width / 2;
+    const centerY = box.y + box.height / 2;
+    try {
+      await page.mouse.move(centerX, centerY, { steps: 8 });
+      await sleep(120);
+      await page.mouse.down();
+      await sleep(120);
+      await page.mouse.up();
+      return true;
+    } catch {
+      /* fall through */
+    }
+  }
+
+  try {
+    await actionButton.click({ timeout: 5_000, delay: 120 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForMicrosoftHumanProofAdvance(page, timeoutMs = MICROSOFT_HUMAN_PROOF_POST_ACTION_WAIT_MS) {
+  const context = page.context();
+  const nextStepPatterns = [
+    /your account has been unblocked/i,
+    /let'?s protect your account/i,
+    /we couldn't create a passkey/i,
+    /stay signed in/i,
+    /let this app access your info/i,
+  ];
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    const retryMessage = await findMicrosoftHumanProofRetryMessage(page, 500);
+    if (retryMessage) {
+      return "retry";
+    }
+
+    const nextPage = await findMicrosoftPageByText(
+      context,
+      nextStepPatterns,
+      500
+    );
+    if (nextPage) {
+      return true;
+    }
+
+    const humanProofStillVisible = await findMicrosoftPageByText(
+      context,
+      [/let'?s prove you'?re human/i],
+      500
+    );
+    if (!humanProofStillVisible) {
+      return true;
+    }
+
+    const resetControls = await findMicrosoftHumanProofControls(page, 500);
+    if (
+      resetControls?.actionLabel &&
+      /press\s*(?:and|&)\s*hold/i.test(resetControls.actionLabel)
+    ) {
+      return "retry";
+    }
+
+    await sleep(500);
+  }
+
+  return "stuck";
+}
+
+async function handleMicrosoftHumanProofPage(page) {
+  logMicrosoftPageTransition("Let's prove you're human");
+  console.log("[auth] Human proof page detected; locating challenge controls.");
+  for (
+    let cycle = 1;
+    cycle <= MICROSOFT_HUMAN_PROOF_MAX_CYCLES;
+    cycle += 1
+  ) {
+    console.log(
+      `[auth] Human proof cycle ${cycle}/${MICROSOFT_HUMAN_PROOF_MAX_CYCLES}`
+    );
+
+    let controls = await findMicrosoftHumanProofControls(page, 10_000);
+    if (!controls) {
+      const iconOnly = await findMicrosoftHumanProofIconControl(page, 5_000);
+      if (iconOnly) {
+        console.log(
+          "[auth] Human proof icon is visible, but the main action button is not ready yet. Continuing with icon activation."
+        );
+        controls = {
+          ...iconOnly,
+          actionButton: null,
+          actionLabel: "",
+        };
+      }
+    }
+    if (!controls) {
+      console.log(
+        "[auth] Human proof page did not expose the accessible challenge icon or the main action button in time."
+      );
+      throw new Error("Microsoft human-proof page did not show the action button.");
+    }
+
+    let progressedControls = null;
+    for (
+      let attempt = 1;
+      attempt <= MICROSOFT_HUMAN_PROOF_MAX_ICON_ATTEMPTS;
+      attempt += 1
+    ) {
+      console.log(
+        `[auth] Human proof icon click attempt ${attempt}/${MICROSOFT_HUMAN_PROOF_MAX_ICON_ATTEMPTS} (cycle ${cycle}/${MICROSOFT_HUMAN_PROOF_MAX_CYCLES})`
+      );
+      const iconActivated = await activateMicrosoftHumanProofIcon(
+        controls.iconButton
+      ).catch(() => false);
+      if (!iconActivated) {
+        console.log(
+          `[auth] Human proof icon click attempt ${attempt}/${MICROSOFT_HUMAN_PROOF_MAX_ICON_ATTEMPTS} did not activate the accessible challenge icon.`
+        );
+        if (attempt < MICROSOFT_HUMAN_PROOF_MAX_ICON_ATTEMPTS) {
+          controls =
+            (await findMicrosoftHumanProofControls(page, 10_000)) ||
+            (await findMicrosoftHumanProofIconControl(page, 10_000));
+          if (controls) continue;
+        }
+        break;
+      }
+
+      progressedControls = await waitForMicrosoftHumanProofControlsByLabel(
+        page,
+        MICROSOFT_HUMAN_PROOF_PROGRESS_LABEL_PATTERN,
+        MICROSOFT_HUMAN_PROOF_ICON_WAIT_MS
+      );
+      if (progressedControls) {
+        console.log(
+          `[auth] Human proof action changed after attempt ${attempt}/${MICROSOFT_HUMAN_PROOF_MAX_ICON_ATTEMPTS}: ${progressedControls.actionLabel}`
+        );
+        break;
+      }
+
+      console.log(
+        `[auth] Human proof action did not change after attempt ${attempt}/${MICROSOFT_HUMAN_PROOF_MAX_ICON_ATTEMPTS}; retrying after ${MICROSOFT_HUMAN_PROOF_ICON_WAIT_MS}ms wait.`
+      );
+      if (attempt < MICROSOFT_HUMAN_PROOF_MAX_ICON_ATTEMPTS) {
+        controls =
+          (await findMicrosoftHumanProofControls(page, 10_000)) ||
+          (await findMicrosoftHumanProofIconControl(page, 10_000));
+        if (controls) continue;
+      }
+      break;
+    }
+
+    if (!progressedControls) {
+      throw new Error(
+        `Microsoft human-proof page did not react after ${MICROSOFT_HUMAN_PROOF_MAX_ICON_ATTEMPTS} accessible challenge icon attempts.`
+      );
+    }
+
+    let readyControls = progressedControls;
+    if (
+      !MICROSOFT_HUMAN_PROOF_PRESS_AGAIN_LABEL_PATTERN.test(
+        readyControls.actionLabel
+      )
+    ) {
+      readyControls =
+        (await waitForMicrosoftHumanProofControlsByLabel(
+          page,
+          MICROSOFT_HUMAN_PROOF_PRESS_AGAIN_LABEL_PATTERN,
+          MICROSOFT_HUMAN_PROOF_ICON_WAIT_MS
+        )) || readyControls;
+    }
+
+    if (
+      !MICROSOFT_HUMAN_PROOF_PRESS_AGAIN_LABEL_PATTERN.test(
+        readyControls.actionLabel || ""
+      )
+    ) {
+      throw new Error(
+        `Microsoft human-proof page did not reach the Press again state after clicking the accessible challenge icon. Last label: ${
+          readyControls.actionLabel || "(empty)"
+        }`
+      );
+    }
+
+    const iconDisabled = await isMicrosoftHumanProofIconDisabled(
+      controls.iconButton
+    ).catch(() => false);
+    if (iconDisabled) {
+      console.log(
+        "[auth] Human proof icon is disabled after challenge activation; will not click it again."
+      );
+    }
+
+    const exactPressAgainState = await findMicrosoftHumanProofExactPressAgainState(
+      page,
+      readyControls.context,
+      5_000
+    );
+    if (!exactPressAgainState) {
+      await debugMicrosoftHumanProofFrames(page, "press-again-not-found");
+      throw new Error(
+        "Microsoft human-proof page reached Press again but the exact Press again control was not found in the active challenge iframe."
+      );
+    }
+
+    if (exactPressAgainState.iconButton) {
+      console.log(
+        "[auth] Human proof icon is disabled in the active Press again iframe; skipping any further icon clicks."
+      );
+    }
+
+    const exactPressAgainControl =
+      (await findMicrosoftHumanProofExactPressAgainControl(
+        page,
+        exactPressAgainState.context,
+        5_000
+      )) || exactPressAgainState;
+
+    console.log(
+      "[auth] Human proof action reached Press again; clicking main action button."
+    );
+    console.log(
+      `[auth] Human proof action target label: ${exactPressAgainControl.actionLabel || "(empty)"}`
+    );
+    if (MICROSOFT_HUMAN_PROOF_PRE_PRESS_AGAIN_DEBUG_SLEEP_MS > 0) {
+      console.log(
+        `[auth] Waiting ${MICROSOFT_HUMAN_PROOF_PRE_PRESS_AGAIN_DEBUG_SLEEP_MS}ms before clicking Press again for inspection.`
+      );
+      await sleep(MICROSOFT_HUMAN_PROOF_PRE_PRESS_AGAIN_DEBUG_SLEEP_MS);
+    }
+    const pressAgainClicked = await clickMicrosoftHumanProofPressAgain(
+      page,
+      exactPressAgainControl.actionButton
+    );
+    if (!pressAgainClicked) {
+      throw new Error(
+        "Microsoft human-proof page did not allow a normal pointer click on the Press again button."
+      );
+    }
+
+    const humanProofOutcome = await waitForMicrosoftHumanProofAdvance(page);
+    if (humanProofOutcome === "advanced") {
+      return;
+    }
+    if (humanProofOutcome === "retry") {
+      console.log(
+        `[auth] Human proof challenge reset after Press again; restarting challenge cycle ${cycle}/${MICROSOFT_HUMAN_PROOF_MAX_CYCLES}.`
+      );
+      await debugMicrosoftHumanProofFrames(page, "after-press-again-retry");
+      if (cycle < MICROSOFT_HUMAN_PROOF_MAX_CYCLES) {
+        await sleep(MICROSOFT_RECOVERY_STEP_WAIT_MS);
+        continue;
+      }
+      throw new Error(
+        `Microsoft human-proof challenge kept resetting after Press again for ${MICROSOFT_HUMAN_PROOF_MAX_CYCLES} cycle(s).`
+      );
+    }
+
+    await debugMicrosoftHumanProofFrames(page, "after-press-again-stuck");
+    throw new Error(
+      "Microsoft human-proof page did not advance after clicking the Press again button."
+    );
+  }
+
+  throw new Error(
+    `Microsoft human-proof challenge kept resetting after Press again for ${MICROSOFT_HUMAN_PROOF_MAX_CYCLES} cycle(s).`
+  );
+}
+
+async function handleMicrosoftPostPasswordFlow(context) {
+  const lockedRecoveryPatterns = [
+    /let'?s prove you'?re human/i,
+    /your account has been unblocked/i,
+    /let'?s protect your account/i,
+    /we couldn't create a passkey/i,
+    /stay signed in/i,
+    /let this app access your info/i,
+  ];
+
+  for (let step = 0; step < 12; step += 1) {
+    let page = await findMicrosoftPageByText(
+      context,
+      [/your account has been locked/i],
+      1_000
+    );
+    if (page) {
+      page = await waitForStableMicrosoftRecoveryPage(context, [
+        /your account has been locked/i,
+      ]);
+      if (!page) {
+        continue;
+      }
+      logMicrosoftPageTransition("Your account has been locked");
+
+      const nextButton = await waitForFirstVisibleLocator(
+        [
+          page
+            .locator('button[type="submit"][data-testid="primaryButton"]')
+            .filter({ hasText: /^next$/i }),
+          page
+            .locator('button[data-testid="primaryButton"]')
+            .filter({ hasText: /^next$/i }),
+          page.getByRole("button", { name: /^next$/i }),
+          page.locator("#idSIButton9"),
+          page.getByText(/^next$/i),
+        ],
+        10_000
+      );
+      if (!nextButton) {
+        throw new Error(
+          "Microsoft locked-account page did not show the Next button."
+        );
+      }
+
+      let advanced = false;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await clickLocatorRobust(nextButton);
+
+        const recoveryPage = await findMicrosoftPageByText(
+          context,
+          lockedRecoveryPatterns,
+          7_500
+        );
+        if (recoveryPage) {
+          advanced = true;
+          break;
+        }
+
+        const stillLocked = await page
+          .getByText(/your account has been locked/i)
+          .first()
+          .isVisible()
+          .catch(() => false);
+        if (!stillLocked) {
+          advanced = true;
+          break;
+        }
+      }
+
+      if (!advanced) {
+        throw new Error(
+          "Microsoft locked-account page stayed on 'Your account has been locked' after clicking Next."
+        );
+      }
+
+      await sleep(MICROSOFT_RECOVERY_STEP_WAIT_MS);
+      continue;
+    }
+
+    page = await findMicrosoftPageByText(
+      context,
+      [/let'?s prove you'?re human/i],
+      1_000
+    );
+    if (page) {
+      page = await waitForStableMicrosoftRecoveryPage(context, [
+        /let'?s prove you'?re human/i,
+      ]);
+      if (!page) {
+        continue;
+      }
+      await handleMicrosoftHumanProofPage(page);
+      await sleep(MICROSOFT_RECOVERY_STEP_WAIT_MS);
+      continue;
+    }
+
+    page = await findMicrosoftPageByText(
+      context,
+      [/your account has been unblocked/i],
+      1_000
+    );
+    if (page) {
+      page = await waitForStableMicrosoftRecoveryPage(context, [
+        /your account has been unblocked/i,
+      ]);
+      if (!page) {
+        continue;
+      }
+      logMicrosoftPageTransition("Your account has been unblocked");
+      const continueButton = await waitForFirstVisibleLocator(
+        [
+          page
+            .locator('button[type="submit"][data-testid="primaryButton"]')
+            .filter({ hasText: /^continue$/i }),
+          page
+            .locator('button[data-testid="primaryButton"]')
+            .filter({ hasText: /^continue$/i }),
+          page
+            .locator('button[type="submit"]')
+            .filter({ hasText: /^continue$/i }),
+          page.getByRole("button", { name: /^continue$/i }),
+          page.locator("#idSIButton9"),
+          page.getByText(/^continue$/i),
+        ],
+        10_000
+      );
+      if (!continueButton) {
+        throw new Error(
+          "Microsoft unblocked page did not show the Continue button."
+        );
+      }
+
+      let continueAdvanced = false;
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        console.log(`[auth] Unblocked page Continue click attempt ${attempt}/3`);
+        await clickLocatorRobust(continueButton);
+
+        const nextPage = await findMicrosoftPageByText(
+          context,
+          [
+            /let'?s protect your account/i,
+            /we couldn't create a passkey/i,
+            /stay signed in/i,
+            /let this app access your info/i,
+          ],
+          7_500
+        );
+        if (nextPage) {
+          continueAdvanced = true;
+          break;
+        }
+
+        const stillUnblocked = await page
+          .getByText(/your account has been unblocked/i)
+          .first()
+          .isVisible()
+          .catch(() => false);
+        if (!stillUnblocked) {
+          continueAdvanced = true;
+          break;
+        }
+      }
+
+      if (!continueAdvanced) {
+        throw new Error(
+          "Microsoft unblocked page did not advance after clicking Continue."
+        );
+      }
+
+      await sleep(MICROSOFT_RECOVERY_STEP_WAIT_MS);
+      continue;
+    }
+
+    page = await findMicrosoftPageByText(
+      context,
+      [/let'?s protect your account/i],
+      1_000
+    );
+    if (page) {
+      page = await waitForStableMicrosoftRecoveryPage(context, [
+        /let'?s protect your account/i,
+      ]);
+      if (!page) {
+        continue;
+      }
+      logMicrosoftPageTransition("Let's protect your account");
+      await clickFirstVisibleLocator(
+        [
+          page.getByText(/skip for now/i),
+          page.getByRole("link", { name: /skip for now/i }),
+          page.getByRole("button", { name: /skip for now/i }),
+        ],
+        10_000
+      );
+      await sleep(MICROSOFT_RECOVERY_STEP_WAIT_MS);
+      continue;
+    }
+
+    page = await findMicrosoftPageByText(
+      context,
+      [/we couldn't create a passkey/i],
+      1_000
+    );
+    if (page) {
+      page = await waitForStableMicrosoftRecoveryPage(context, [
+        /we couldn't create a passkey/i,
+      ]);
+      if (!page) {
+        continue;
+      }
+      logMicrosoftPageTransition("We couldn't create a passkey");
+      await clickFirstVisibleLocator(
+        [
+          page.getByRole("button", { name: /^cancel$/i }),
+          page.getByText(/^cancel$/i),
+        ],
+        10_000
+      );
+      await sleep(MICROSOFT_RECOVERY_STEP_WAIT_MS);
+      continue;
+    }
+
+    page = await findMicrosoftPageByText(
+      context,
+      [/stay signed in/i],
+      2_000
+    );
+    if (page) {
+      page = await waitForStableMicrosoftRecoveryPage(context, [
+        /stay signed in/i,
+      ]);
+      if (!page) {
+        continue;
+      }
+      logMicrosoftPageTransition("Stay signed in?");
+      const handledStaySignedIn = await clickFirstVisibleLocator(
+        [
+          page.getByRole("button", { name: /^yes$/i }),
+          page.getByText(/^yes$/i),
+        ],
+        10_000
+      );
+      if (!handledStaySignedIn) {
+        throw new Error(
+          "Microsoft login reached Stay signed in? but the Yes button was not clickable."
+        );
+      }
+      await sleep(MICROSOFT_RECOVERY_STEP_WAIT_MS);
+      continue;
+    }
+
+    page = await findMicrosoftPageByText(
+      context,
+      [/let this app access your info/i],
+      3_000
+    );
+    if (page) {
+      page = await waitForStableMicrosoftRecoveryPage(context, [
+        /let this app access your info/i,
+      ]);
+      if (!page) {
+        continue;
+      }
+      logMicrosoftPageTransition("Let this app access your info?");
+      await clickFirstVisibleLocator(
+        [
+          page.getByRole("button", { name: /^accept$/i }),
+          page.getByText(/^accept$/i),
+        ],
+        10_000
+      );
+      await sleep(MICROSOFT_RECOVERY_STEP_WAIT_MS);
+      continue;
+    }
+
+    return;
+  }
+}
+
 async function completeMicrosoftSocialLogin(authPage, email, password) {
   const normalizedEmail = String(email || "").trim();
   const normalizedPassword = String(password || "");
@@ -1926,6 +3090,7 @@ async function completeMicrosoftSocialLogin(authPage, email, password) {
     );
   }
   authPage = emailStep.page;
+  logMicrosoftPageTransition("Microsoft email entry");
   await emailStep.locator.fill(normalizedEmail);
   const emailNextClicked = await clickFirstVisibleLocator(
     [
@@ -1955,6 +3120,7 @@ async function completeMicrosoftSocialLogin(authPage, email, password) {
     );
   }
   authPage = passwordStep.page;
+  logMicrosoftPageTransition("Microsoft password entry");
   await passwordStep.locator.fill(normalizedPassword);
   const passwordNextClicked = await clickFirstVisibleLocator(
     [
@@ -1970,31 +3136,9 @@ async function completeMicrosoftSocialLogin(authPage, email, password) {
     );
   }
 
-  const staySignedInStep = await findMicrosoftStepPage(
-    context,
-    (candidate) => [
-      candidate.locator("#idBtn_Back"),
-      candidate.getByRole("button", { name: /^no$/i }),
-      candidate.getByRole("button", { name: /^yes$/i }),
-      candidate.locator("#idSIButton9"),
-    ],
-    10_000
-  );
-  if (staySignedInStep) {
-    authPage = staySignedInStep.page;
-    const handledStaySignedIn = await clickFirstVisibleLocator(
-      [
-        authPage.locator("#idBtn_Back"),
-        authPage.getByRole("button", { name: /^no$/i }),
-        authPage.getByRole("button", { name: /^yes$/i }),
-        authPage.locator("#idSIButton9"),
-      ],
-      5_000
-    );
-    if (!handledStaySignedIn) {
-      throw new Error("Microsoft login reached Stay signed in? but no button was clickable.");
-    }
-  }
+  await sleep(MICROSOFT_RECOVERY_STEP_WAIT_MS);
+
+  await handleMicrosoftPostPasswordFlow(context);
 }
 
 async function waitForContactOutPage(pages, timeoutMs = 120_000) {
@@ -2507,7 +3651,9 @@ async function main() {
   }
   loadScrapeDomEval();
 
-  const userDataDir = path.join(ROOT, "playwright-user-data", workerKey);
+  const workerProfileRootDir = path.join(ROOT, "playwright-user-data", workerKey);
+  const accountProfileRootDir = path.join(workerProfileRootDir, "accounts");
+  fs.mkdirSync(accountProfileRootDir, { recursive: true });
   const exportDir = path.resolve(
     process.env.EXPORT_DIR || path.join(ROOT, "exports")
   );
@@ -2747,9 +3893,6 @@ async function main() {
       `[proxy] Bad runtime status: ${currentProxyLabel()} | ${reason} | ${currentSessionLabel()}${suffix}`
     );
   };
-  const storageStatePath = path.join(userDataDir, "storage-state.json");
-  const sessionAccountStatePath = path.join(userDataDir, "session-account.json");
-  fs.mkdirSync(userDataDir, { recursive: true });
   const backoff429 =
     parseInt(process.env.PROXY_429_BACKOFF_MS || "60000", 10) || 60000;
   const emptyPageRetryMax = Math.max(
@@ -3073,12 +4216,47 @@ async function main() {
 
   let loggedIn = false;
   let pagesSinceRotate = 0;
+  let currentProfileEmail = "";
 
   function normalizeEmailIdentity(value) {
     return String(value || "").trim().toLowerCase();
   }
 
-  function loadStoredSessionAccountEmail() {
+  function accountProfileKey(email) {
+    const normalized = normalizeEmailIdentity(email) || "default";
+    const readable = normalized
+      .split("@")[0]
+      .replace(/[^a-z0-9._-]+/gi, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 40) || "account";
+    const digest = crypto
+      .createHash("sha1")
+      .update(normalized)
+      .digest("hex")
+      .slice(0, 12);
+    return `${readable}-${digest}`;
+  }
+
+  function profileDirForEmail(email) {
+    return path.join(accountProfileRootDir, accountProfileKey(email));
+  }
+
+  function storageStatePathForEmail(email) {
+    return path.join(profileDirForEmail(email), "storage-state.json");
+  }
+
+  function sessionAccountStatePathForEmail(email) {
+    return path.join(profileDirForEmail(email), "session-account.json");
+  }
+
+  function ensureProfileDirForEmail(email) {
+    const profileDir = profileDirForEmail(email);
+    fs.mkdirSync(profileDir, { recursive: true });
+    return profileDir;
+  }
+
+  function loadStoredSessionAccountEmail(profileEmail = currentEmail()) {
+    const sessionAccountStatePath = sessionAccountStatePathForEmail(profileEmail);
     try {
       const raw = JSON.parse(fs.readFileSync(sessionAccountStatePath, "utf8"));
       return normalizeEmailIdentity(raw?.email);
@@ -3087,9 +4265,13 @@ async function main() {
     }
   }
 
-  function saveStoredSessionAccountEmail(email) {
+  function saveStoredSessionAccountEmail(
+    email,
+    profileEmail = currentProfileEmail || email
+  ) {
     const normalized = normalizeEmailIdentity(email);
     if (!normalized) return;
+    const sessionAccountStatePath = sessionAccountStatePathForEmail(profileEmail);
     fs.mkdirSync(path.dirname(sessionAccountStatePath), { recursive: true });
     fs.writeFileSync(
       sessionAccountStatePath,
@@ -3105,7 +4287,10 @@ async function main() {
     );
   }
 
-  function clearStoredSessionAccountEmail() {
+  function clearStoredSessionAccountEmail(
+    profileEmail = currentProfileEmail || currentEmail()
+  ) {
+    const sessionAccountStatePath = sessionAccountStatePathForEmail(profileEmail);
     try {
       if (fs.existsSync(sessionAccountStatePath)) {
         fs.unlinkSync(sessionAccountStatePath);
@@ -3115,7 +4300,10 @@ async function main() {
     }
   }
 
-  function hasPersistedSessionArtifacts() {
+  function hasPersistedSessionArtifacts(profileEmail = currentEmail()) {
+    const storageStatePath = storageStatePathForEmail(profileEmail);
+    const sessionAccountStatePath = sessionAccountStatePathForEmail(profileEmail);
+    const userDataDir = profileDirForEmail(profileEmail);
     if (rotator) {
       return (
         fs.existsSync(storageStatePath) || fs.existsSync(sessionAccountStatePath)
@@ -3134,8 +4322,8 @@ async function main() {
 
   function describeStoredSessionForAccount(email) {
     const targetEmail = normalizeEmailIdentity(email);
-    const storedEmail = loadStoredSessionAccountEmail();
-    const hasArtifacts = hasPersistedSessionArtifacts();
+    const storedEmail = loadStoredSessionAccountEmail(targetEmail);
+    const hasArtifacts = hasPersistedSessionArtifacts(targetEmail);
 
     if (!hasArtifacts) {
       return {
@@ -3181,12 +4369,14 @@ async function main() {
   }
 
   function rememberCurrentAccountSession() {
-    saveStoredSessionAccountEmail(currentEmail());
+    saveStoredSessionAccountEmail(currentEmail(), currentProfileEmail || currentEmail());
   }
 
-  async function persistSession() {
+  async function persistSession(profileEmail = currentProfileEmail || currentEmail()) {
     if (!rotator || !context) return;
     try {
+      const storageStatePath = storageStatePathForEmail(profileEmail);
+      fs.mkdirSync(path.dirname(storageStatePath), { recursive: true });
       await context.storageState({ path: storageStatePath });
     } catch {
       /* ignore */
@@ -3358,6 +4548,20 @@ async function main() {
     }, null);
   }
 
+  function resetProfileArtifacts(profileEmail, options = {}) {
+    const profileDir = profileDirForEmail(profileEmail);
+    try {
+      fs.rmSync(profileDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+    fs.mkdirSync(profileDir, { recursive: true });
+    clearStoredSessionAccountEmail(profileEmail);
+    if (options.logLabel) {
+      console.log(`${options.logLabel} ${normalizeEmailIdentity(profileEmail)}.`);
+    }
+  }
+
   /**
    * @param {string} reason
    * @param {{ clearSession?: boolean, advanceProxy?: boolean }} [options]
@@ -3365,50 +4569,67 @@ async function main() {
   async function recreateProxyContext(reason, options = {}) {
     const clearSession = Boolean(options.clearSession);
     const advanceProxy = options.advanceProxy !== false;
+    const targetProfileEmail = normalizeEmailIdentity(currentEmail());
+    const previousProfileEmail = normalizeEmailIdentity(currentProfileEmail);
+    const switchingProfile =
+      Boolean(previousProfileEmail) && previousProfileEmail !== targetProfileEmail;
+    const targetUserDataDir = ensureProfileDirForEmail(targetProfileEmail);
+    const targetStorageStatePath = storageStatePathForEmail(targetProfileEmail);
 
     if (rotator) {
-      if (!browser) {
-        browser = await chromium.launch({ headless: envHeadless() });
+      if (previousProfileEmail && context && (!clearSession || switchingProfile)) {
+        await persistSession(previousProfileEmail);
       }
 
-      try {
-        if (clearSession && context) {
-          await context.clearCookies();
-          console.log("[proxy] Cleared browser context cookies (fresh session).");
+      if (switchingProfile && browser) {
+        await context?.close().catch(() => {});
+        context = undefined;
+        page = undefined;
+        await browser.close().catch(() => {});
+        browser = null;
+        console.log(
+          `[auth] Switching to isolated browser profile for ${targetProfileEmail} (previous ${previousProfileEmail}).`
+        );
+      } else if (clearSession) {
+        try {
+          if (context) {
+            await context.clearCookies();
+            console.log("[proxy] Cleared browser context cookies (fresh session).");
+          }
+        } catch {
+          /* ignore */
         }
-      } catch {
-        /* ignore */
       }
 
-    if (!clearSession) {
-      await persistSession();
-    } else {
-      try {
-        if (fs.existsSync(storageStatePath)) {
-          fs.unlinkSync(storageStatePath);
-          console.log(
-            "[proxy] Deleted saved storage-state (fresh session)."
-          );
-        }
-      } catch {
-        /* ignore */
-      }
-      clearStoredSessionAccountEmail();
+    if (clearSession) {
+      resetProfileArtifacts(targetProfileEmail, {
+        logLabel: "[proxy] Reset stored browser profile for",
+      });
     }
 
-    await context?.close().catch(() => {});
+    if (!switchingProfile) {
+      await context?.close().catch(() => {});
+      context = undefined;
+      page = undefined;
+    }
     if (advanceProxy) {
       rotator.advance();
     }
     await skipUntilHealthyProxy(rotator, reason);
 
-    const useSavedState = !clearSession && fs.existsSync(storageStatePath);
+    if (!browser) {
+      browser = await chromium.launch({ headless: envHeadless() });
+    }
+
+    const useSavedState =
+      !clearSession && fs.existsSync(targetStorageStatePath);
     context = await browser.newContext({
       viewport: { width: 1280, height: 800 },
       proxy: rotator.current(),
-      storageState: useSavedState ? storageStatePath : undefined,
+      storageState: useSavedState ? targetStorageStatePath : undefined,
     });
     page = await context.newPage();
+    currentProfileEmail = targetProfileEmail;
     console.log(
       `[proxy] New browser context (${reason}) → ${rotator.peekLabel()}`
     );
@@ -3416,22 +4637,24 @@ async function main() {
 
     else {
       await context?.close().catch(() => {});
+      context = undefined;
+      page = undefined;
       if (clearSession) {
-        try {
-          fs.rmSync(userDataDir, { recursive: true, force: true });
-        } catch {
-          /* ignore */
-        }
-        fs.mkdirSync(userDataDir, { recursive: true });
-        clearStoredSessionAccountEmail();
-        console.log("[auth] Cleared persistent browser profile (fresh session).");
+        resetProfileArtifacts(targetProfileEmail, {
+          logLabel: "[auth] Cleared persistent browser profile for",
+        });
+      } else {
+        fs.mkdirSync(targetUserDataDir, { recursive: true });
       }
-      context = await chromium.launchPersistentContext(userDataDir, {
+      context = await chromium.launchPersistentContext(targetUserDataDir, {
         headless: envHeadless(),
         viewport: { width: 1280, height: 800 },
       });
       page = context.pages()[0] || (await context.newPage());
-      console.log(`[auth] New browser context (${reason})`);
+      currentProfileEmail = targetProfileEmail;
+      console.log(
+        `[auth] New browser context (${reason}) | profile ${targetProfileEmail}`
+      );
     }
     loggedIn = false;
   }

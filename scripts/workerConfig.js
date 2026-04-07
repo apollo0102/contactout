@@ -6,10 +6,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export const ROOT = path.resolve(__dirname, "..");
 export const EMAIL_LISTS_CONFIG_PATH = path.join(ROOT, "ref", "emailList.js");
-export const LEGACY_EMAILS_CONFIG_PATH = path.join(ROOT, "ref", "emails.js");
-export const EMAILS_CONFIG_PATH = fs.existsSync(EMAIL_LISTS_CONFIG_PATH)
-  ? EMAIL_LISTS_CONFIG_PATH
-  : LEGACY_EMAILS_CONFIG_PATH;
+export const EMAILS_CONFIG_PATH = EMAIL_LISTS_CONFIG_PATH;
 export const PROXIES_CONFIG_PATH = path.join(ROOT, "ref", "proxies.js");
 export const LEGACY_PROXIES_FILE_PATH = path.join(ROOT, "ref", "proxies.txt");
 export const WORKER_GENDERS = ["male", "female", "unknown"];

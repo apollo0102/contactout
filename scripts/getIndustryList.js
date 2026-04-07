@@ -3,12 +3,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { chromium } from "playwright";
-import { loadEmailConfig } from "./workerConfig.js";
+import { EMAILS_CONFIG_PATH, loadEmailConfig } from "./workerConfig.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
 const CONSTANTS_CONFIG_PATH = path.join(ROOT, "ref", "constants.js");
-const EMAILS_CONFIG_PATH = path.join(ROOT, "ref", "emails.js");
 const STORAGE_STATE_PATH = path.join(ROOT, "playwright-user-data", "storage-state.json");
 const OUTPUT_PATH = path.join(ROOT, "ref", "industry-list.json");
 
@@ -34,10 +33,31 @@ async function loadAccounts() {
     workerSlot: workerSlotRaw,
     workerGender: preferredGender,
   });
-  if (!emailPool.length || !password) {
-    throw new Error("Missing login emails or CONTACTOUT_PASSWORD in ref/emails.js");
+  const firstAccount = emailPool
+    .map((rawEntry) => {
+      const raw = String(rawEntry ?? "").trim();
+      if (!raw) return null;
+      const separatorIndex = raw.indexOf(":");
+      if (separatorIndex < 0) {
+        return {
+          email: raw,
+          password: String(password || "").trim(),
+        };
+      }
+      return {
+        email: raw.slice(0, separatorIndex).trim(),
+        password:
+          raw.slice(separatorIndex + 1).trim() || String(password || "").trim(),
+      };
+    })
+    .find((account) => account?.email && account?.password);
+
+  if (!firstAccount) {
+    throw new Error(
+      `Missing login account or password in ${path.relative(ROOT, EMAILS_CONFIG_PATH)}`
+    );
   }
-  return { email: emailPool[0], password };
+  return firstAccount;
 }
 
 function buildSearchUrl(constants) {

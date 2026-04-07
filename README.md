@@ -43,12 +43,17 @@ By default the browser window is visible. Set `HEADLESS=1` to run headless. **Pe
 
 ## Environment variables
 
+Primary login accounts now come from `ref/emailList.js` using `EMAIL_LIST` or
+slot-specific bindings such as `EMAIL_FIRST_LIST`, where each item can be
+`email:password`. The environment variables below remain available as fallback
+input sources when you do not want to use the config file.
+
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `EMAIL_USER` | When login needed | One login email (alternative: see below) |
-| `EMAIL_USER1`, `EMAIL_USER2`, … | When login needed | Multiple accounts in order; **same password** as `CONTACTOUT_PASSWORD` for all. On **HTTP 429**, the bot switches to the **next** email, puts the current one on cooldown, and clears session before signing in again |
-| `EMAIL_USERS` | When login needed | Comma- or newline-separated list (instead of numbered `EMAIL_USER*` vars) |
-| `CONTACTOUT_PASSWORD` | When login needed | Password shared by all accounts in the pool |
+| `EMAIL_USER` | Fallback only | One login email (alternative: see below) |
+| `EMAIL_USER1`, `EMAIL_USER2`, … | Fallback only | Multiple accounts in order; each value can be `email[:password]`. On **HTTP 429**, the bot switches to the **next** email, puts the current one on cooldown, and clears session before signing in again |
+| `EMAIL_USERS` | Fallback only | Comma- or newline-separated list (instead of numbered `EMAIL_USER*` vars); each value can be `email[:password]` |
+| `CONTACTOUT_PASSWORD` | Fallback only | Shared password used only when an account entry does not already include its own password |
 | `EMAIL_429_COOLDOWN_HOURS` | No | Hours to keep a login email on cooldown after **HTTP 429** before it can be reused again; default `24`. Cooldowns are persisted per worker slot under `ref/email-cooldowns/` |
 | `CONTACTOUT_LOCATION` | No | Optional explicit location override used to build the default search URL as `?location=…` |
 | `CONTACTOUT_SEARCH_URL` | No | Full dashboard search URL. Any `page=` is removed; the bot sets `page`. If set, overrides **`SEARCH_PROFILE`** and **`SEARCH_RANDOM`** |
@@ -94,11 +99,12 @@ With any proxy env set, the bot uses **`chromium.launch()`** (not the persistent
 Example `.env`:
 
 ```env
-EMAIL_USER=you@example.com
+EMAIL_USER=you@example.com:your-secret-password
 # Or several accounts (429 rotates through them):
-# EMAIL_USER1=first@example.com
-# EMAIL_USER2=second@example.com
-CONTACTOUT_PASSWORD=your-secret-password
+# EMAIL_USER1=first@example.com:first-password
+# EMAIL_USER2=second@example.com:second-password
+# Optional fallback only when the account entry has no password:
+# CONTACTOUT_PASSWORD=your-secret-password
 CONTACTOUT_LOCATION=United States
 MAX_PAGES=5
 # HEADLESS=1

@@ -1,10 +1,10 @@
 export const PROXIES_FIRST_LIST = [
+    "http://crazydevstar007:BAz68R7U49@185.228.193.180:50100",
+    "http://crazydevstar007:BAz68R7U49@68.67.198.53:50100",
+    "http://crazydevstar007:BAz68R7U49@95.164.151.75:50100",
     "http://crazydevstar007:BAz68R7U49@74.0.100.61:50100",
     "http://crazydevstar007:BAz68R7U49@209.101.150.121:50100",
-    "http://crazydevstar007:BAz68R7U49@95.164.151.75:50100",
-    "http://crazydevstar007:BAz68R7U49@185.228.193.180:50100",
     "http://crazydevstar007:BAz68R7U49@151.247.123.13:50100",
-    "http://crazydevstar007:BAz68R7U49@68.67.198.53:50100",
     "http://crazydevstar007:BAz68R7U49@104.219.171.86:50100",
     "http://crazydevstar007:BAz68R7U49@66.93.51.2:50100",
     "http://crazydevstar007:BAz68R7U49@151.247.125.195:50100",
