@@ -1302,6 +1302,42 @@ function setSearchParam(searchUrl, key, value) {
   return u.toString();
 }
 
+function setSearchParamValues(searchUrl, key, values) {
+  const u = new URL(searchUrl, "https://contactout.com");
+  u.searchParams.delete(key);
+  for (const value of Array.isArray(values) ? values : []) {
+    const item = String(value ?? "").trim();
+    if (!item) continue;
+    u.searchParams.append(key, item);
+  }
+  u.searchParams.delete("page");
+  return u.toString();
+}
+
+function chunkStringList(values, size) {
+  const normalized = Array.isArray(values)
+    ? values.map((value) => String(value ?? "").trim()).filter(Boolean)
+    : [];
+  const chunkSize = Math.max(1, parseInt(String(size), 10) || 1);
+  const out = [];
+  for (let index = 0; index < normalized.length; index += chunkSize) {
+    out.push(normalized.slice(index, index + chunkSize));
+  }
+  return out;
+}
+
+function buildIndustryGroupLabel(industryValues, groupIndex = 0) {
+  const items = Array.isArray(industryValues)
+    ? industryValues.map((value) => String(value ?? "").trim()).filter(Boolean)
+    : [];
+  if (!items.length) return "";
+  const labelIndex = String(groupIndex + 1).padStart(3, "0");
+  if (items.length === 1) {
+    return `group-${labelIndex}-${items[0]}`;
+  }
+  return `group-${labelIndex}-${items[0]}-to-${items[items.length - 1]}`;
+}
+
 function applySearchUrlOverrides(searchUrl, flatParams = {}) {
   let nextUrl = searchUrl;
   for (const [key, value] of Object.entries(flatParams)) {
@@ -3882,13 +3918,31 @@ async function main() {
 
     return latestMs;
   };
-  const nextSearchPageFromHistory = (searchBaseUrl, firstPage = 1) => {
+
+  const completedPagesFromHistory = (searchBaseUrl, firstPage = 1) => {
     const entry = getSearchHistoryEntry(searchBaseUrl);
-    const completedPages = Array.isArray(entry?.pagesCompleted)
+    return Array.isArray(entry?.pagesCompleted)
       ? entry.pagesCompleted.filter(
           (pageNum) => Number.isInteger(pageNum) && pageNum >= firstPage
         )
       : [];
+  };
+
+  const pageCapForPlan = (plan) =>
+    Array.isArray(plan?.industryValues) && plan.industryValues.length > 0
+      ? searchIndustryPageCap
+      : 0;
+
+  const isPlanHistoryPageCapped = (plan, searchBaseUrl) => {
+    const pageCap = pageCapForPlan(plan);
+    if (!pageCap) return false;
+    const completedPages = completedPagesFromHistory(searchBaseUrl, 1);
+    if (!completedPages.length) return false;
+    return Math.max(...completedPages) >= pageCap;
+  };
+
+  const nextSearchPageFromHistory = (searchBaseUrl, firstPage = 1) => {
+    const completedPages = completedPagesFromHistory(searchBaseUrl, firstPage);
     if (!completedPages.length) return firstPage;
 
     // Resume from the furthest completed page for the latest active leaf branch,
@@ -3913,6 +3967,13 @@ async function main() {
         latestMs = subtreeLastUpdatedMs;
         startIndex = index;
       }
+    }
+
+    while (startIndex < plans.length) {
+      const plan = plans[startIndex];
+      const searchBaseUrl = normalizeSearchBaseUrl(plan.searchUrlRaw);
+      if (!isPlanHistoryPageCapped(plan, searchBaseUrl)) break;
+      startIndex += 1;
     }
 
     // Continue forward from the latest active subtree while preserving the
@@ -4950,6 +5011,8 @@ async function main() {
   const searchEmployeeSizeList = parseSearchEmployeeSizeListEnv();
   const searchRevenueRanges = parseSearchRevenueRangesEnv();
   const searchIndustryList = parseSearchIndustryListEnv();
+  const searchIndustryGroupSize = envInt("SEARCH_INDUSTRY_GROUP_SIZE", 5, 1);
+  const searchIndustryPageCap = envInt("SEARCH_INDUSTRY_PAGE_CAP", 100, 1);
 
   const writeIntermediateMergedJson = (mergePlan, reason = "threshold") => {
     if (!writeIntermediateMerges) return false;
@@ -5244,6 +5307,13 @@ async function main() {
   const runSearchPlan = async (plan) => {
     const searchBaseUrl = normalizeSearchBaseUrl(plan.searchUrlRaw);
     const searchId = searchIdFromBaseUrl(searchBaseUrl);
+    const planPageCap = pageCapForPlan(plan);
+    if (isPlanHistoryPageCapped(plan, searchBaseUrl)) {
+      console.log(
+        `[contactout-bot] Skip search${plan.industry ? ` (industry=${plan.industry})` : ""}: page cap ${planPageCap} already reached for ${searchBaseUrl}`
+      );
+      return;
+    }
     const historyEntry = getSearchHistoryEntry(searchBaseUrl);
     const resumePage = nextSearchPageFromHistory(searchBaseUrl, startPage);
     const canResumeDirectly =
@@ -5253,6 +5323,12 @@ async function main() {
       resumePage > startPage;
     const firstUrl = buildSearchUrlWithPage(searchBaseUrl, startPage);
     const entryPage = canResumeDirectly ? resumePage : startPage;
+    if (planPageCap > 0 && entryPage > planPageCap) {
+      console.log(
+        `[contactout-bot] Skip search${plan.industry ? ` (industry=${plan.industry})` : ""}: next page ${entryPage} is beyond capped page ${planPageCap}`
+      );
+      return;
+    }
     const entryUrl = buildSearchUrlWithPage(searchBaseUrl, entryPage);
     console.log(
       `[contactout-bot] Starting search${plan.role ? ` (role=${plan.role})` : ""}${plan.gender ? ` (gender=${plan.gender})` : ""}: ${searchBaseUrl}`
@@ -5547,25 +5623,41 @@ async function main() {
         (!plan.years && !searchYearsList.length && !searchTotalYearsList.length && !searchEmployeeSizeList.length && !searchRevenueRanges.length)
       )
     ) {
-      console.log(
-        `[contactout-bot]${plan.gender ? ` gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}${plan.revenueMin || plan.revenueMax ? ` revenue=${plan.revenueMin || "min"}-${plan.revenueMax || "plus"}` : ""} has ${profileCount.total} profiles (> ${searchProfileThreshold}); splitting by industry: ${searchIndustryList.join(", ")}`
+      const industryGroups = chunkStringList(
+        searchIndustryList,
+        searchIndustryGroupSize
       );
-      const industryPlans = searchIndustryList.map((industry) => ({
-        ...plan,
-        searchUrlRaw: setSearchParam(searchBaseUrl, "industry", industry),
-        exportNameSuffix: buildExportNameSuffix({
-          country: plan.country,
-          role: plan.role,
-          gender: plan.gender,
-          years: plan.years,
-          totalYears: plan.totalYears,
-          employeeSize: plan.employeeSize,
-          revenueMin: plan.revenueMin,
-          revenueMax: plan.revenueMax,
-          industry,
-        }),
-        industry: String(industry).trim(),
-      }));
+      console.log(
+        `[contactout-bot]${plan.gender ? ` gender=${plan.gender}` : ""}${plan.years ? ` years=${plan.years}` : ""}${plan.totalYears ? ` totalYears=${plan.totalYears}` : ""}${plan.employeeSize ? ` employeeSize=${plan.employeeSize}` : ""}${plan.revenueMin || plan.revenueMax ? ` revenue=${plan.revenueMin || "min"}-${plan.revenueMax || "plus"}` : ""} has ${profileCount.total} profiles (> ${searchProfileThreshold}); splitting by industry groups of ${searchIndustryGroupSize} (groups=${industryGroups.length}, page cap=${searchIndustryPageCap})`
+      );
+      const industryPlans = industryGroups.map((industryValues, groupIndex) => {
+        const industryLabel = buildIndustryGroupLabel(
+          industryValues,
+          groupIndex
+        );
+        return {
+          ...plan,
+          searchUrlRaw: setSearchParamValues(
+            searchBaseUrl,
+            "industry",
+            industryValues
+          ),
+          exportNameSuffix: buildExportNameSuffix({
+            country: plan.country,
+            role: plan.role,
+            gender: plan.gender,
+            years: plan.years,
+            totalYears: plan.totalYears,
+            employeeSize: plan.employeeSize,
+            revenueMin: plan.revenueMin,
+            revenueMax: plan.revenueMax,
+            industry: industryLabel,
+          }),
+          industry: industryLabel,
+          industryValues,
+          industryGroupIndex: groupIndex + 1,
+        };
+      });
       for (const industryPlan of plansFromResumePoint(industryPlans)) {
         await runSearchPlan(industryPlan);
       }
@@ -5678,7 +5770,31 @@ async function main() {
       return { empty: true, rows: [] };
     };
 
-    if (unlimitedPages) {
+    const effectiveEndPage = planPageCap > 0 ? planPageCap : 0;
+
+    if (effectiveEndPage > 0) {
+      let stoppedByPageCap = effectiveStartPage <= effectiveEndPage;
+      for (let pageNum = effectiveStartPage; pageNum <= effectiveEndPage; pageNum++) {
+        const res = await processPage(pageNum);
+        if (res == null) continue;
+        if (res.empty) {
+          console.log(
+            `[contactout-bot] No rows on URL page=${pageNum}; stopping${plan.industry ? ` for industry=${plan.industry}` : ""}.`
+          );
+          stoppedByPageCap = false;
+          break;
+        }
+        if (res.duplicate) {
+          stoppedByPageCap = false;
+          break;
+        }
+      }
+      if (stoppedByPageCap) {
+        console.log(
+          `[contactout-bot] Reached capped page ${effectiveEndPage}${plan.industry ? ` for industry=${plan.industry}` : ""}; moving to the next sibling branch.`
+        );
+      }
+    } else if (unlimitedPages) {
       for (let pageNum = effectiveStartPage; ; pageNum++) {
         const res = await processPage(pageNum);
         if (res == null) continue;
