@@ -3822,52 +3822,102 @@ async function main() {
     const searchId = searchIdFromBaseUrl(searchBaseUrl);
     return history.searches?.[searchId] || null;
   };
-  const searchHistoryLastUpdatedMs = (searchBaseUrl) => {
-    const lastUpdated = getSearchHistoryEntry(searchBaseUrl)?.lastUpdated;
-    const parsed = Date.parse(String(lastUpdated || ""));
-    return Number.isFinite(parsed) ? parsed : 0;
+
+  const searchUrlSignatureCache = new Map();
+  const getSearchUrlSignature = (searchUrl) => {
+    const baseUrl = normalizeSearchBaseUrl(searchUrl);
+    const cached = searchUrlSignatureCache.get(baseUrl);
+    if (cached) return cached;
+
+    const u = new URL(baseUrl, "https://contactout.com");
+    const params = new Map();
+    const keys = [...new Set([...u.searchParams.keys()])].sort();
+    for (const key of keys) {
+      params.set(key, u.searchParams.getAll(key).map(String).sort());
+    }
+
+    const signature = {
+      baseUrl,
+      originPath: `${u.origin}${u.pathname}`,
+      params,
+    };
+    searchUrlSignatureCache.set(baseUrl, signature);
+    return signature;
+  };
+
+  const searchUrlContainsPlanParams = (candidateUrl, planUrl) => {
+    const candidate = getSearchUrlSignature(candidateUrl);
+    const required = getSearchUrlSignature(planUrl);
+    if (candidate.originPath !== required.originPath) return false;
+
+    for (const [key, requiredValues] of required.params.entries()) {
+      const candidateValues = candidate.params.get(key);
+      if (!candidateValues || candidateValues.length !== requiredValues.length) {
+        return false;
+      }
+      for (let index = 0; index < requiredValues.length; index += 1) {
+        if (candidateValues[index] !== requiredValues[index]) {
+          return false;
+        }
+      }
+    }
+    return true;
+  };
+
+  const searchHistorySubtreeLastUpdatedMs = (searchBaseUrl) => {
+    if (ignoreSearchHistory) return 0;
+    const requiredUrl = normalizeSearchBaseUrl(searchBaseUrl);
+    let latestMs = 0;
+
+    for (const entry of Object.values(history.searches || {})) {
+      const candidateUrl = String(entry?.canonicalBaseUrl || "").trim();
+      if (!candidateUrl) continue;
+      if (!searchUrlContainsPlanParams(candidateUrl, requiredUrl)) continue;
+
+      const parsed = Date.parse(String(entry?.lastUpdated || ""));
+      if (Number.isFinite(parsed) && parsed > latestMs) {
+        latestMs = parsed;
+      }
+    }
+
+    return latestMs;
   };
   const nextSearchPageFromHistory = (searchBaseUrl, firstPage = 1) => {
     const entry = getSearchHistoryEntry(searchBaseUrl);
     const completedPages = Array.isArray(entry?.pagesCompleted)
-      ? entry.pagesCompleted
+      ? entry.pagesCompleted.filter(
+          (pageNum) => Number.isInteger(pageNum) && pageNum >= firstPage
+        )
       : [];
     if (!completedPages.length) return firstPage;
-    const completedSet = new Set(
-      completedPages.filter(
-        (pageNum) => Number.isInteger(pageNum) && pageNum >= firstPage
-      )
-    );
-    let nextPage = firstPage;
-    while (completedSet.has(nextPage)) {
-      nextPage += 1;
-    }
-    return nextPage;
+
+    // Resume from the furthest completed page for the latest active leaf branch,
+    // rather than backfilling the first missing page inside the history entry.
+    return Math.max(...completedPages) + 1;
   };
-  const sortPlansByResumePriority = (plans) => {
+
+  const plansFromResumePoint = (plans) => {
     if (ignoreSearchHistory || !Array.isArray(plans) || plans.length <= 1) {
       return Array.isArray(plans) ? plans : [];
     }
-    return plans
-      .map((plan, index) => ({
-        plan,
-        index,
-        lastUpdatedMs: searchHistoryLastUpdatedMs(
-          normalizeSearchBaseUrl(plan.searchUrlRaw)
-        ),
-      }))
-      .sort((a, b) => {
-        const aHasHistory = a.lastUpdatedMs > 0;
-        const bHasHistory = b.lastUpdatedMs > 0;
-        if (aHasHistory !== bHasHistory) {
-          return aHasHistory ? -1 : 1;
-        }
-        if (a.lastUpdatedMs !== b.lastUpdatedMs) {
-          return b.lastUpdatedMs - a.lastUpdatedMs;
-        }
-        return a.index - b.index;
-      })
-      .map((item) => item.plan);
+
+    let startIndex = 0;
+    let latestMs = 0;
+
+    for (let index = 0; index < plans.length; index += 1) {
+      const plan = plans[index];
+      const subtreeLastUpdatedMs = searchHistorySubtreeLastUpdatedMs(
+        normalizeSearchBaseUrl(plan.searchUrlRaw)
+      );
+      if (subtreeLastUpdatedMs > latestMs) {
+        latestMs = subtreeLastUpdatedMs;
+        startIndex = index;
+      }
+    }
+
+    // Continue forward from the latest active subtree while preserving the
+    // declared search-param order for remaining sibling branches.
+    return plans.slice(startIndex);
   };
   const mergePlansByKey = new Map(
     mergePlans.map((mergePlan) => [mergePlan.mergeKey, mergePlan])
@@ -5371,7 +5421,7 @@ async function main() {
         }),
         years: String(years).trim(),
       }));
-      for (const yearPlan of sortPlansByResumePriority(yearPlans)) {
+      for (const yearPlan of plansFromResumePoint(yearPlans)) {
         await runSearchPlan(yearPlan);
       }
       return;
@@ -5405,7 +5455,7 @@ async function main() {
           }),
           employeeSize: String(employeeSize).trim(),
         }));
-      for (const employeeSizePlan of sortPlansByResumePriority(employeeSizePlans)) {
+      for (const employeeSizePlan of plansFromResumePoint(employeeSizePlans)) {
         await runSearchPlan(employeeSizePlan);
       }
       return;
@@ -5434,7 +5484,7 @@ async function main() {
         }),
         totalYears: String(totalYears).trim(),
       }));
-      for (const totalYearsPlan of sortPlansByResumePriority(totalYearsPlans)) {
+      for (const totalYearsPlan of plansFromResumePoint(totalYearsPlans)) {
         await runSearchPlan(totalYearsPlan);
       }
       return;
@@ -5477,7 +5527,7 @@ async function main() {
           revenueMax: range.revenueMax,
         };
       });
-      for (const revenuePlan of sortPlansByResumePriority(revenuePlans)) {
+      for (const revenuePlan of plansFromResumePoint(revenuePlans)) {
         await runSearchPlan(revenuePlan);
       }
       return;
@@ -5516,7 +5566,7 @@ async function main() {
         }),
         industry: String(industry).trim(),
       }));
-      for (const industryPlan of sortPlansByResumePriority(industryPlans)) {
+      for (const industryPlan of plansFromResumePoint(industryPlans)) {
         await runSearchPlan(industryPlan);
       }
       return;
@@ -5662,7 +5712,7 @@ async function main() {
   try {
     primePendingRawTasks();
 
-    for (const plan of sortPlansByResumePriority(searchPlans)) {
+    for (const plan of plansFromResumePoint(searchPlans)) {
       await runSearchPlan(plan);
     }
 
