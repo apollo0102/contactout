@@ -12,7 +12,7 @@ const SEARCH_YEARS = [0,1,2,3,4,5]
 
 //Third priority in search
 //Total years of experience // 0_1: less than 1 year, 1_2: 1-2 years, 3_5: 3-5 years, 6_10: 6-10 years, 10_9999: more than 10 years
-const SEARCH_TOTALYEARS = ["0_1", "1_2", "3-5", "6_10", "10_9999"]
+const SEARCH_TOTALYEARS = ["0_1", "1_2", "3_5", "6_10", "10_9999"]
 
 //Fourth priority in search
 //employee_size // 1-10: 1_10, 11-50: 11_50, 51-200:51_200, 201-500: 201_500, 501-1000: 501_1000, 1001-5000: 1001_5000, 5001-10000: 5001_10000, 10000+: 10001

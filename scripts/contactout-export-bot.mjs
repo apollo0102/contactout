@@ -1171,7 +1171,10 @@ function canonicalSearchKey(baseUrl) {
   const keys = [...new Set([...u.searchParams.keys()])].sort();
   const pairs = [];
   for (const k of keys) {
-    const vals = u.searchParams.getAll(k).sort();
+    const vals = normalizeSearchParamValuesForMatching(
+      k,
+      u.searchParams.getAll(k)
+    ).sort();
     for (const v of vals) {
       pairs.push(`${encodeURIComponent(k)}=${encodeURIComponent(v)}`);
     }
@@ -1291,12 +1294,56 @@ function buildSearchUrlWithPage(baseUrl, pageNum) {
   return u.toString();
 }
 
+function normalizeSearchParamKey(key) {
+  return String(key ?? "").trim();
+}
+
+function normalizeSearchParamValuesForMatching(key, values) {
+  const normalizedKey = normalizeSearchParamKey(key);
+  const input = Array.isArray(values) ? values : [values];
+  const items = [];
+
+  for (const value of input) {
+    const raw = String(value ?? "").trim();
+    if (!raw) continue;
+
+    if (normalizedKey === "industry") {
+      for (const part of raw.split("|")) {
+        const item = String(part ?? "").trim();
+        if (item) items.push(item);
+      }
+      continue;
+    }
+
+    if (normalizedKey === "totalYears" || normalizedKey === "total_years") {
+      items.push(raw === "3_5" ? "3-5" : raw);
+      continue;
+    }
+
+    items.push(raw);
+  }
+
+  return [...new Set(items)];
+}
+
+function normalizeSearchParamValueForUrl(key, value) {
+  const normalizedKey = normalizeSearchParamKey(key);
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+
+  if (normalizedKey === "totalYears" || normalizedKey === "total_years") {
+    return raw === "3-5" ? "3_5" : raw;
+  }
+
+  return raw;
+}
+
 function setSearchParam(searchUrl, key, value) {
   const u = new URL(searchUrl, "https://contactout.com");
   if (value === undefined || value === null || String(value).trim() === "") {
     u.searchParams.delete(key);
   } else {
-    u.searchParams.set(key, String(value).trim());
+    u.searchParams.set(key, normalizeSearchParamValueForUrl(key, value));
   }
   u.searchParams.delete("page");
   return u.toString();
@@ -1305,10 +1352,15 @@ function setSearchParam(searchUrl, key, value) {
 function setSearchParamValues(searchUrl, key, values) {
   const u = new URL(searchUrl, "https://contactout.com");
   u.searchParams.delete(key);
-  for (const value of Array.isArray(values) ? values : []) {
-    const item = String(value ?? "").trim();
-    if (!item) continue;
-    u.searchParams.append(key, item);
+  const items = normalizeSearchParamValuesForMatching(key, values);
+  if (items.length) {
+    if (normalizeSearchParamKey(key) === "industry") {
+      u.searchParams.set(key, items.join("|"));
+    } else {
+      for (const item of items) {
+        u.searchParams.append(key, normalizeSearchParamValueForUrl(key, item));
+      }
+    }
   }
   u.searchParams.delete("page");
   return u.toString();
@@ -1534,7 +1586,7 @@ function buildContactOutSearchUrl(flatParams, baseUrl) {
   u.search = "";
   for (const [k, v] of Object.entries(flatParams)) {
     if (v === undefined || v === null) continue;
-    const s = String(v).trim();
+    const s = normalizeSearchParamValueForUrl(k, v);
     if (s === "") continue;
     u.searchParams.set(k, s);
   }
@@ -3543,6 +3595,20 @@ async function maybeRunRoleWorkers() {
   const deadSlots = new Map();
   const slotPollMs = 1_000;
 
+  const formatActiveRolesSummary = () =>
+    [...currentRolesBySlot.entries()]
+      .map(([slot, role]) => `${workerSlotDisplay(slot)}="${role}"`)
+      .join(", ");
+
+  const formatPendingRolesPreview = (limit = 5) => {
+    const preview = pendingRoles
+      .slice(0, limit)
+      .map((task) => `"${task.role}"`)
+      .join(", ");
+    if (!preview) return "none";
+    return pendingRoles.length > limit ? `${preview}, ...` : preview;
+  };
+
   const formatDeadSlotSummary = () =>
     [...deadSlots.values()]
       .map(
@@ -3553,12 +3619,15 @@ async function maybeRunRoleWorkers() {
 
   const logDeadSlotStatus = (label = "[worker] Dead slot status") => {
     if (!deadSlots.size) return;
-    const activeRoles = [...currentRolesBySlot.entries()]
-      .map(([slot, role]) => `${workerSlotDisplay(slot)}="${role}"`)
-      .join(", ");
+    const activeRoles = formatActiveRolesSummary();
     console.warn(
-      `${label}: ${formatDeadSlotSummary()}${activeRoles ? ` | active ${activeRoles}` : ""} | live=${liveSlots.size}/${workerSlots.length} | pending=${pendingRoles.length}`
+      `${label}: dead=${deadSlots.size} live=${liveSlots.size}/${workerSlots.length} pending=${pendingRoles.length}${activeRoles ? ` | active ${activeRoles}` : ""} | pending roles ${formatPendingRolesPreview()}`
     );
+    for (const failure of deadSlots.values()) {
+      console.warn(
+        `[worker][dead-slot] ${workerSlotDisplay(failure.slot)} failed on role "${failure.role}" at ${failure.failedAt} | reason: ${failure.message}`
+      );
+    }
   };
 
   const deadSlotLogTimer = setInterval(() => {
@@ -3869,7 +3938,10 @@ async function main() {
     const params = new Map();
     const keys = [...new Set([...u.searchParams.keys()])].sort();
     for (const key of keys) {
-      params.set(key, u.searchParams.getAll(key).map(String).sort());
+      params.set(
+        key,
+        normalizeSearchParamValuesForMatching(key, u.searchParams.getAll(key)).sort()
+      );
     }
 
     const signature = {
