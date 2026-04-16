@@ -1,7 +1,7 @@
 // CONTACTOUT_PASSWORD=Glo123456!
 const SEARCH_COUNTRY_LIST = ["United States"]
 
-const SEARCH_ROLE_LIST = ["Project Manager", "Operations Manager", "Sales Manager", "Marketing Manager", "Finance Manager", "Accounting Manager", "HR Manager", "Customer Success Manager", "Business Development Manager", "IT Manager", "Compliance Manager"]
+const SEARCH_ROLE_LIST = ["Project Manager", "Operations Manager", "Sales Manager", "Marketing Manager", "Finance Manager", "Accounting Manager"]
 
 //First priority in search
 const SEARCH_GENDER_LIST = ["Male", "Female", "Unknown"]

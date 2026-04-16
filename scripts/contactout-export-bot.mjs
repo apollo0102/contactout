@@ -5011,12 +5011,10 @@ async function main() {
           });
         } catch (e) {
           const tunnelFail =
-            rotator &&
-            failoversForThisNav < proxyFailoverCap &&
+            Boolean(rotator) &&
             isProxyTunnelFailError(e);
           const navTimeout =
-            rotator &&
-            failoversForThisNav < proxyFailoverCap &&
+            Boolean(rotator) &&
             isNavigationTimeoutError(e);
           if (tunnelFail || navTimeout) {
             failoversForThisNav += 1;
@@ -5029,6 +5027,14 @@ async function main() {
             console.warn(
               `[proxy] Failover session ${currentSessionLabel()}`
             );
+            if (
+              proxyFailoverCap > 0 &&
+              failoversForThisNav % proxyFailoverCap === 0
+            ) {
+              console.warn(
+                `[proxy] ${label}: exhausted one full proxy failover cycle (${proxyFailoverCap}/${proxyFailoverCap}); keeping the worker alive and continuing to wait for the next healthy proxy.`
+              );
+            }
             rotator?.markCooldown(proxyFailureCooldownMs, reason);
             await recreateProxyContext(reason, {
               clearSession: false,
